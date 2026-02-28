@@ -1,0 +1,53 @@
+{
+    "manifest_version": 3,
+    "name": "MindStack",
+    "description": "The Learning Ghost — passively capture what you read and watch into your second brain.",
+    "version": "1.0.0",
+    "permissions": [
+        "storage",
+        "activeTab",
+        "scripting",
+        "notifications"
+    ],
+    "host_permissions": [
+        "<all_urls>",
+        "https://mind-stack-theta.vercel.app/*"
+    ],
+    "background": {
+        "service_worker": "src/background/background.ts",
+        "type": "module"
+    },
+    "action": {
+        "default_popup": "src/popup/popup.html",
+        "default_title": "MindStack",
+        "default_icon": {
+            "128": "icons/icon128.png"
+        }
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "js": [
+                "src/content/content-reader.ts"
+            ],
+            "run_at": "document_idle",
+            "exclude_matches": [
+                "*://*.youtube.com/*"
+            ]
+        },
+        {
+            "matches": [
+                "*://*.youtube.com/*"
+            ],
+            "js": [
+                "src/content/content-youtube.ts"
+            ],
+            "run_at": "document_idle"
+        }
+    ],
+    "icons": {
+        "128": "icons/icon128.png"
+    }
+}

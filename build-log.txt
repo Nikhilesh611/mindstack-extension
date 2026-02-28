@@ -1,0 +1,36 @@
+
+> mindstack-extension@1.0.0 build
+> vite build
+
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+[36mvite v5.4.21 [32mbuilding for production...[36m[39m
+transforming...
+(node:10468) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///e:/FullStackForge/SecondBrain/mindstack-extension/postcss.config.js is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to e:\FullStackForge\SecondBrain\mindstack-extension\package.json.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✓[39m 17 modules transformed.
+[31mx[39m Build failed in 1.30s
+[31merror during build:
+[31m[vite:esbuild] Transform failed with 1 error:
+E:/FullStackForge/SecondBrain/mindstack-extension/src/popup/components/CommandCenter.tsx:23:59: ERROR: Expected identifier but found "{"[31m
+file: [36mE:/FullStackForge/SecondBrain/mindstack-extension/src/popup/components/CommandCenter.tsx:23:59[31m
+[33m
+[33mExpected identifier but found "{"[33m
+21 |  
+22 |      // Send messages to background
+23 |      const sendMsg = useCallback(<T>(msg: unknown): Promise<{ success: boolean; data?: T; error?: string }> => {
+   |                                                             ^
+24 |      return new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve));
+25 |    }, []);
+[31m
+    at failureErrorWithLog (e:\FullStackForge\SecondBrain\mindstack-extension\node_modules\esbuild\lib\main.js:1472:15)
+    at e:\FullStackForge\SecondBrain\mindstack-extension\node_modules\esbuild\lib\main.js:755:50
+    at responseCallbacks.<computed> (e:\FullStackForge\SecondBrain\mindstack-extension\node_modules\esbuild\lib\main.js:622:9)
+    at handleIncomingPacket (e:\FullStackForge\SecondBrain\mindstack-extension\node_modules\esbuild\lib\main.js:677:12)
+    at Socket.readFromStdout (e:\FullStackForge\SecondBrain\mindstack-extension\node_modules\esbuild\lib\main.js:600:7)
+    at Socket.emit (node:events:518:28)
+    at addChunk (node:internal/streams/readable:561:12)
+    at readableAddChunkPushByteMode (node:internal/streams/readable:512:3)
+    at Readable.push (node:internal/streams/readable:392:5)
+    at Pipe.onStreamRead (node:internal/stream_base_commons:189:23)[39m

@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body, #root {
+    width: 400px;
+    min-height: 500px;
+    max-height: 680px;
+    margin: 0;
+    padding: 0;
+    background-color: #0F172A;
+    color: #CBD5E1;
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 13px;
+    overflow-x: hidden;
+  }
+
+  ::-webkit-scrollbar {
+    width: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0F172A;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #334155;
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #475569;
+  }
+}
+
+@layer components {
+  .ghost-input {
+    @apply w-full bg-ghost-surface border border-ghost-border rounded-md px-3 py-2 text-ghost-text placeholder-ghost-muted font-mono text-xs focus:outline-none focus:border-ghost-accent focus:ring-1 focus:ring-ghost-accent/30 transition-colors;
+  }
+
+  .ghost-btn {
+    @apply px-4 py-2 rounded-md font-mono text-xs font-semibold transition-all duration-150 focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-offset-ghost-bg disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .ghost-btn-primary {
+    @apply ghost-btn bg-ghost-accent text-ghost-bg hover:brightness-110 focus:ring-ghost-accent;
+  }
+
+  .ghost-btn-danger {
+    @apply ghost-btn bg-ghost-red/20 text-ghost-red border border-ghost-red/30 hover:bg-ghost-red/30 focus:ring-ghost-red;
+  }
+
+  .ghost-btn-ghost {
+    @apply ghost-btn bg-transparent text-ghost-muted border border-ghost-border hover:border-ghost-accent hover:text-ghost-accent focus:ring-ghost-accent;
+  }
+
+  .ghost-card {
+    @apply bg-ghost-surface border border-ghost-border rounded-lg p-3;
+  }
+
+  .ghost-label {
+    @apply font-mono text-[10px] font-semibold tracking-widest text-ghost-muted uppercase;
+  }
+
+  .pulse-dot {
+    @apply w-2 h-2 rounded-full bg-ghost-green animate-pulse-slow shadow-[0_0_8px_rgba(74,222,128,0.6)];
+  }
+
+  .inactive-dot {
+    @apply w-2 h-2 rounded-full bg-ghost-muted;
+  }
+}
