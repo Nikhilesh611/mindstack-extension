@@ -57,7 +57,7 @@ function injectToast(message: string): void {
     overflow: hidden;
     text-overflow: ellipsis;
   `;
-    toast.textContent = `ðŸ‘» MindStack: ${message}`;
+    toast.textContent = '👻 MindStack: ' + message;
     document.body.appendChild(toast);
 
     requestAnimationFrame(() => {
@@ -131,8 +131,8 @@ async function sendCapture(
 
             if (response?.success) {
                 // Fix â‘£: Stealth toast notification
-                const shortTitle = cachedTitle.slice(0, 40) + (cachedTitle.length > 40 ? 'â€¦' : '');
-                injectToast(`Captured â€” ${shortTitle}`);
+                const shortTitle = cachedTitle.slice(0, 40) + (cachedTitle.length > 40 ? '\u2026' : '');
+                injectToast('Captured \u2014 ' + shortTitle);
             }
         }
     );
