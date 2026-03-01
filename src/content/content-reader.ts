@@ -1,4 +1,4 @@
-﻿export {};
+﻿export { };
 /**
  * content-reader.ts
  * Passive web text capture for all non-YouTube pages.
@@ -123,6 +123,12 @@ async function sendCapture(
             },
         },
         (response) => {
+            // Must read lastError to suppress Chrome's "unchecked runtime.lastError"
+            // which appears as a misleading 403 in DevTools when the background
+            // service worker is asleep (normal MV3 behaviour) or the context
+            // was invalidated after an extension reload.
+            if (chrome.runtime.lastError) return;
+
             if (response?.success) {
                 // Fix â‘£: Stealth toast notification
                 const shortTitle = cachedTitle.slice(0, 40) + (cachedTitle.length > 40 ? 'â€¦' : '');

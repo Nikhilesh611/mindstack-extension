@@ -9,9 +9,30 @@ interface CommandCenterProps {
 
 type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
 
-// Module-level helper avoids TSX generic-arrow JSX ambiguity (TS1700)
+// Robust sendMsg — handles MV3 service-worker sleep/wake cycle.
+// When the background SW is sleeping, Chrome fires the callback with
+// `undefined` and sets chrome.runtime.lastError. We read lastError to
+// suppress the unchecked-error console noise, then retry once after a
+// short delay (giving Chrome time to restart the SW).
 function sendMsg<T>(msg: unknown): Promise<{ success: boolean; data?: T; error?: string }> {
-    return new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve));
+    return new Promise((resolve) => {
+        chrome.runtime.sendMessage(msg, (response) => {
+            if (chrome.runtime.lastError || response === undefined) {
+                // SW was asleep — wait briefly then retry once
+                setTimeout(() => {
+                    chrome.runtime.sendMessage(msg, (retryResponse) => {
+                        if (chrome.runtime.lastError || retryResponse === undefined) {
+                            resolve({ success: false, error: 'Extension service worker is starting up — please try again.' });
+                        } else {
+                            resolve(retryResponse as { success: boolean; data?: T; error?: string });
+                        }
+                    });
+                }, 200);
+            } else {
+                resolve(response as { success: boolean; data?: T; error?: string });
+            }
+        });
+    });
 }
 
 export default function CommandCenter({ onLogout }: CommandCenterProps) {
@@ -278,8 +299,8 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
                                 key={tab}
                                 onClick={() => setActiveTab(tab)}
                                 className={`flex-1 py-2.5 font-mono text-xs font-semibold transition-colors ${activeTab === tab
-                                        ? 'text-ghost-accent border-b-2 border-ghost-accent -mb-px'
-                                        : 'text-ghost-muted hover:text-ghost-text'
+                                    ? 'text-ghost-accent border-b-2 border-ghost-accent -mb-px'
+                                    : 'text-ghost-muted hover:text-ghost-text'
                                     }`}
                             >
                                 {tab === 'feed' ? '⚡ Live Feed' : '📦 Vault'}

@@ -6,8 +6,26 @@ interface LiveFeedProps {
     activeSessionId: string | null;
 }
 
+// Robust sendMsg — handles MV3 service-worker sleep/wake cycle.
+// Reads lastError and retries once after 200ms if the SW was asleep.
 function sendMsg<T>(msg: unknown): Promise<MessageResponse<T>> {
-    return new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve));
+    return new Promise((resolve) => {
+        chrome.runtime.sendMessage(msg, (response) => {
+            if (chrome.runtime.lastError || response === undefined) {
+                setTimeout(() => {
+                    chrome.runtime.sendMessage(msg, (retryResponse) => {
+                        if (chrome.runtime.lastError || retryResponse === undefined) {
+                            resolve({ success: false, error: 'Extension service worker is starting up — please try again.' } as MessageResponse<T>);
+                        } else {
+                            resolve(retryResponse as MessageResponse<T>);
+                        }
+                    });
+                }, 200);
+            } else {
+                resolve(response as MessageResponse<T>);
+            }
+        });
+    });
 }
 
 const CAPTURE_TYPE_META: Record<string, { icon: string; label: string; color: string }> = {
