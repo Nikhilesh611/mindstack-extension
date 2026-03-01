@@ -1,4 +1,4 @@
-﻿export {};
+﻿export { };
 /**
  * content-youtube.ts
  * Video segment tracker for YouTube (youtube.com only).
@@ -7,12 +7,22 @@
  *   - Re-initializes on `yt-navigate-finish` (YouTube SPA navigation)
  *   - MutationObserver fallback to detect <video> element
  *   - Tracks video play/pause to record (startTime, endTime) segments
- *   - Captures a Base64 JPEG keyframe from a hidden <canvas>
+ *   - Frame snapshot captured SYNCHRONOUSLY at the moment of capture (before
+ *     any async work) so the canvas always contains the correct frame
+ *   - Periodic auto-capture: up to MAX_PERIODIC_CAPTURES per session, interval
+ *     spread evenly across the video duration (min MIN_CAPTURE_INTERVAL_MS)
+ *   - On pause: immediate frame snapshot + segment send
  *   - Sends INGEST_VIDEO message to background (background handles S3 + ingest)
- *   - Injects stealth toast on success (Fix â‘£)
+ *   - Injects stealth toast on success
  */
 
-const MIN_SEGMENT_DURATION_SEC = 5; // don't capture tiny accidental plays
+const MIN_SEGMENT_DURATION_SEC = 3;   // lower so short intervals aren't silently dropped
+const MAX_PERIODIC_CAPTURES = 10;  // max auto-captures per video session
+const MIN_CAPTURE_INTERVAL_MS = 30_000; // never fire faster than every 30 s
+
+// ---------------------------------------------------------------------------
+// Toast
+// ---------------------------------------------------------------------------
 
 function injectToast(message: string): void {
     const toast = document.createElement('div');
@@ -38,7 +48,7 @@ function injectToast(message: string): void {
     overflow: hidden;
     text-overflow: ellipsis;
   `;
-    toast.textContent = `ðŸ‘» MindStack: ${message}`;
+    toast.textContent = `👻 MindStack: ${message}`;
     document.body.appendChild(toast);
 
     requestAnimationFrame(() => {
@@ -55,20 +65,28 @@ function injectToast(message: string): void {
     }, 2500);
 }
 
+// ---------------------------------------------------------------------------
+// Frame capture  — MUST be called synchronously (before any await)
+// ---------------------------------------------------------------------------
+
 function captureKeyframe(video: HTMLVideoElement): string | null {
     try {
         const canvas = document.createElement('canvas');
-        canvas.width = 320;
-        canvas.height = 180;
+        canvas.width = 1280; // HD width
+        canvas.height = 720;  // HD height
         const ctx = canvas.getContext('2d');
         if (!ctx) return null;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        return canvas.toDataURL('image/jpeg', 0.7);
+        return canvas.toDataURL('image/jpeg', 0.85);
     } catch (e) {
         console.warn('[MindStack YT] Canvas capture failed:', e);
         return null;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Session helpers
+// ---------------------------------------------------------------------------
 
 async function getActiveSession(): Promise<{ sessionId: string; projectId: string } | null> {
     return new Promise((resolve) => {
@@ -80,18 +98,32 @@ async function getActiveSession(): Promise<{ sessionId: string; projectId: strin
     });
 }
 
+// ---------------------------------------------------------------------------
+// Segment sender
+// frame is captured by the CALLER synchronously, then passed in here so the
+// async session lookup doesn't cause us to draw from the wrong video position.
+// ---------------------------------------------------------------------------
+
 async function sendVideoSegment(
     video: HTMLVideoElement,
     startTime: number,
-    endTime: number
+    endTime: number,
+    preCapturedFrame?: string | null,
 ): Promise<void> {
-    const duration = endTime - startTime;
-    if (duration < MIN_SEGMENT_DURATION_SEC) return;
+    const segDuration = endTime - startTime;
+    if (segDuration < MIN_SEGMENT_DURATION_SEC) {
+        console.log(`[MindStack YT] Segment too short (${segDuration.toFixed(1)}s) — skipped.`);
+        return;
+    }
 
     const session = await getActiveSession();
-    if (!session) return;
+    if (!session) {
+        console.warn('[MindStack YT] No active session — skipped.');
+        return;
+    }
 
-    const base64Frame = captureKeyframe(video);
+    // Use caller-supplied frame, or fall back to capturing now (best-effort)
+    const base64Frame = preCapturedFrame ?? captureKeyframe(video) ?? '';
 
     const payload = {
         type: 'INGEST_VIDEO' as const,
@@ -102,28 +134,35 @@ async function sendVideoSegment(
             page_title: document.title,
             video_start_time: Math.floor(startTime),
             video_end_time: Math.floor(endTime),
-            base64Frame: base64Frame ?? '',
+            base64Frame,
         },
     };
 
     chrome.runtime.sendMessage(payload, (response) => {
+        // Guard against MV3 service worker being idle (chrome.runtime.lastError must be read)
+        if (chrome.runtime.lastError) {
+            console.warn('[MindStack YT] sendMessage error:', chrome.runtime.lastError.message);
+            return;
+        }
         if (response?.success) {
             const title = document.title.replace(' - YouTube', '').slice(0, 35);
-            injectToast(`Video captured â€” ${title}`);
+            injectToast(`Captured — ${title}`);
         } else {
             console.warn('[MindStack YT] Video ingest failed:', response?.error);
         }
     });
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ---------------------------------------------------------------------------
 // Video Tracker
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ---------------------------------------------------------------------------
 
 class VideoTracker {
     private video: HTMLVideoElement;
     private segmentStartTime: number | null = null;
-    private periodicTimer: ReturnType<typeof setInterval> | null = null;
+    private captureCount = 0;   // periodic captures so far this session
+    private intervalTimer: ReturnType<typeof setTimeout> | null = null;
+
     private onPlayBound: () => void;
     private onPauseBound: () => void;
     private onEndedBound: () => void;
@@ -151,16 +190,24 @@ class VideoTracker {
         console.log('[MindStack YT] Video tracker destroyed.');
     }
 
+    // ---- event handlers -----------------------------------------------
+
     private onPlay(): void {
         this.segmentStartTime = this.video.currentTime;
-        this.startPeriodicCapture();
+        this.scheduleNextCapture();
+        console.log(`[MindStack YT] Play — segment started at ${this.segmentStartTime.toFixed(1)}s`);
     }
 
     private onPause(): void {
         this.stopPeriodicCapture();
         if (this.segmentStartTime !== null) {
-            sendVideoSegment(this.video, this.segmentStartTime, this.video.currentTime);
+            // ✅ Capture frame synchronously right now, before any async work
+            const frame = captureKeyframe(this.video);
+            const endTime = this.video.currentTime;
+            const startTime = this.segmentStartTime;
             this.segmentStartTime = null;
+            console.log(`[MindStack YT] Pause — sending segment ${startTime.toFixed(1)}s → ${endTime.toFixed(1)}s`);
+            sendVideoSegment(this.video, startTime, endTime, frame);
         }
     }
 
@@ -168,29 +215,64 @@ class VideoTracker {
         this.onPause();
     }
 
-    private startPeriodicCapture(): void {
-        this.stopPeriodicCapture();
-        // Capture a segment every 60 seconds of continuous play
-        this.periodicTimer = setInterval(async () => {
+    // ---- periodic capture (setTimeout loop) ---------------------------
+
+    /**
+     * Schedules the next periodic capture.
+     * Using setTimeout (not setInterval) so the delay recalculates from the
+     * current video.duration on every tick — handles cases where YouTube
+     * delivers duration late.
+     */
+    private scheduleNextCapture(): void {
+        if (this.captureCount >= MAX_PERIODIC_CAPTURES) {
+            console.log('[MindStack YT] Periodic cap reached — no more auto-captures.');
+            return;
+        }
+
+        const duration = this.video.duration;
+        const intervalMs = isFinite(duration) && duration > 0
+            ? Math.max((duration / MAX_PERIODIC_CAPTURES) * 1000, MIN_CAPTURE_INTERVAL_MS)
+            : MIN_CAPTURE_INTERVAL_MS;
+
+        console.log(
+            `[MindStack YT] Next periodic capture in ${(intervalMs / 1000).toFixed(0)}s ` +
+            `(capture ${this.captureCount + 1}/${MAX_PERIODIC_CAPTURES}, ` +
+            `video duration: ${isFinite(duration) ? duration.toFixed(0) + 's' : 'unknown'})`,
+        );
+
+        this.intervalTimer = setTimeout(() => {
+            this.intervalTimer = null;
+
+            // Skip if video is paused/ended (onPause already handled it)
+            if (this.video.paused || this.video.ended) return;
             if (this.segmentStartTime === null) return;
+
+            // ✅ Capture frame synchronously before any async work
+            const frame = captureKeyframe(this.video);
             const endTime = this.video.currentTime;
             const startTime = this.segmentStartTime;
-            this.segmentStartTime = endTime; // reset for next segment
-            await sendVideoSegment(this.video, startTime, endTime);
-        }, 60_000);
+            this.segmentStartTime = endTime; // slide the window forward
+            this.captureCount++;
+
+            console.log(`[MindStack YT] Periodic capture #${this.captureCount}/${MAX_PERIODIC_CAPTURES} at ${endTime.toFixed(1)}s`);
+            sendVideoSegment(this.video, startTime, endTime, frame);
+
+            // Schedule the next one
+            this.scheduleNextCapture();
+        }, intervalMs);
     }
 
     private stopPeriodicCapture(): void {
-        if (this.periodicTimer !== null) {
-            clearInterval(this.periodicTimer);
-            this.periodicTimer = null;
+        if (this.intervalTimer !== null) {
+            clearTimeout(this.intervalTimer);
+            this.intervalTimer = null;
         }
     }
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ---------------------------------------------------------------------------
 // Page Lifecycle Manager
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ---------------------------------------------------------------------------
 
 let currentTracker: VideoTracker | null = null;
 
@@ -218,13 +300,11 @@ function initTracker(video: HTMLVideoElement): void {
     currentTracker = new VideoTracker(video);
 }
 
-// YouTube SPA navigation â€” re-initialize on each video navigation
+// YouTube SPA navigation — re-initialize on each video navigation
 window.addEventListener('yt-navigate-finish', () => {
-    console.log('[MindStack YT] yt-navigate-finish fired â€” re-initializing tracker.');
-    // Small delay to let YouTube mount the new <video> element
+    console.log('[MindStack YT] yt-navigate-finish fired — re-initializing tracker.');
     setTimeout(findAndTrackVideo, 800);
 });
 
 // Initial load
 findAndTrackVideo();
-

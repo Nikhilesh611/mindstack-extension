@@ -297,7 +297,7 @@ async function handleMessage(message: ExtensionMessage): Promise<MessageResponse
                 const s3PutRes = await fetch(upload_url, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'image/jpeg' },
-                    body: bytes.buffer,
+                    body: bytes.buffer as ArrayBuffer,
                 });
 
                 if (!s3PutRes.ok) {
