@@ -116,6 +116,7 @@ export interface IngestVideoMessage extends BaseMessage {
         video_start_time: number;
         video_end_time: number;
         base64Frame: string;
+        caption_text?: string; // live subtitle text at moment of capture (for AI context)
     };
 }
 

@@ -18,6 +18,19 @@ const IGNORED_SELECTORS = ['nav', 'header', 'footer', 'aside', '[role="navigatio
 const CONTENT_SELECTORS = 'p, article, section, code, pre, blockquote, li, h1, h2, h3, h4';
 const MIN_TEXT_LENGTH = 80;
 
+/**
+ * Returns false when the extension has been reloaded/updated and this
+ * content-script's context is no longer valid. Any chrome.* call made
+ * after invalidation throws "Extension context invalidated."
+ */
+function isContextValid(): boolean {
+    try {
+        return !!chrome.runtime?.id;
+    } catch {
+        return false;
+    }
+}
+
 // Simple FNV-1a 32-bit hash for dedup
 function hashText(text: string): string {
     let hash = 2166136261;
@@ -84,10 +97,15 @@ const pendingTimers = new Map<Element, ReturnType<typeof setTimeout>>();
 let isSessionActive = false;
 
 async function checkSessionActive(): Promise<boolean> {
+    if (!isContextValid()) return false;
     return new Promise((resolve) => {
-        chrome.storage.local.get(['mindstack_session_id'], (result) => {
-            resolve(!!result['mindstack_session_id']);
-        });
+        try {
+            chrome.storage.local.get(['mindstack_session_id'], (result) => {
+                resolve(!!result['mindstack_session_id']);
+            });
+        } catch {
+            resolve(false);
+        }
     });
 }
 
@@ -100,42 +118,55 @@ async function sendCapture(
     if (sentHashes.has(hash)) return;
     sentHashes.add(hash);
 
+    // Guard: context may have been invalidated if the extension was reloaded
+    if (!isContextValid()) return;
+
     // Re-read session/project from storage at send time (MV3 safety)
-    const stored: Record<string, string> = await new Promise((resolve) =>
-        chrome.storage.local.get(['mindstack_session_id', 'mindstack_project_id'], resolve as () => void)
-    );
+    const stored: Record<string, string> = await new Promise((resolve) => {
+        try {
+            chrome.storage.local.get(['mindstack_session_id', 'mindstack_project_id'], resolve as () => void);
+        } catch {
+            resolve({});
+        }
+    });
+
+    if (!isContextValid()) return; // re-check after the async gap
 
     const sessionId = stored['mindstack_session_id'];
     const projectId = stored['mindstack_project_id'];
     if (!sessionId || !projectId) return;
 
-    chrome.runtime.sendMessage(
-        {
-            type: 'INGEST_BROWSER',
-            payload: {
-                session_id: sessionId,
-                project_id: projectId,
-                capture_type: 'WEB_TEXT',
-                text_content: text.trim().slice(0, 4000),
-                source_url: cachedUrl,
-                page_title: cachedTitle,
-                priority: 1,
+    try {
+        chrome.runtime.sendMessage(
+            {
+                type: 'INGEST_BROWSER',
+                payload: {
+                    session_id: sessionId,
+                    project_id: projectId,
+                    capture_type: 'WEB_TEXT',
+                    text_content: text.trim().slice(0, 4000),
+                    source_url: cachedUrl,
+                    page_title: cachedTitle,
+                    priority: 1,
+                },
             },
-        },
-        (response) => {
-            // Must read lastError to suppress Chrome's "unchecked runtime.lastError"
-            // which appears as a misleading 403 in DevTools when the background
-            // service worker is asleep (normal MV3 behaviour) or the context
-            // was invalidated after an extension reload.
-            if (chrome.runtime.lastError) return;
+            (response) => {
+                // Must read lastError to suppress Chrome's "unchecked runtime.lastError"
+                // which appears as a misleading 403 in DevTools when the background
+                // service worker is asleep (normal MV3 behaviour) or the context
+                // was invalidated after an extension reload.
+                if (chrome.runtime.lastError) return;
 
-            if (response?.success) {
-                // Fix â‘£: Stealth toast notification
-                const shortTitle = cachedTitle.slice(0, 40) + (cachedTitle.length > 40 ? '\u2026' : '');
-                injectToast('Captured \u2014 ' + shortTitle);
+                if (response?.success) {
+                    // Fix ④: Stealth toast notification
+                    const shortTitle = cachedTitle.slice(0, 40) + (cachedTitle.length > 40 ? '\u2026' : '');
+                    injectToast('Captured — ' + shortTitle);
+                }
             }
-        }
-    );
+        );
+    } catch {
+        // Context was invalidated between the guard and the sendMessage call — ignore.
+    }
 }
 
 function setupObserver(): void {
@@ -216,8 +247,15 @@ async function main(): Promise<void> {
         setupObserver();
     }
 
-    // Poll for session state changes (e.g., user started a new session while on the page)
-    setInterval(async () => {
+    // Poll for session state changes (e.g., user started a new session while on the page).
+    // Self-cancels when the extension context is invalidated (reload/update).
+    const pollInterval = setInterval(async () => {
+        if (!isContextValid()) {
+            clearInterval(pollInterval);
+            pendingTimers.forEach(clearTimeout);
+            pendingTimers.clear();
+            return;
+        }
         const nowActive = await checkSessionActive();
         if (nowActive && !isSessionActive) {
             isSessionActive = true;

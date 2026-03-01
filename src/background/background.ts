@@ -271,7 +271,7 @@ async function handleMessage(message: ExtensionMessage): Promise<MessageResponse
                 return { success: false, error: 'No active session.' };
             }
 
-            const { source_url, page_title, video_start_time, video_end_time, base64Frame } =
+            const { source_url, page_title, video_start_time, video_end_time, base64Frame, caption_text } =
                 message.payload;
 
             // Step 1: Get presigned URL
@@ -318,6 +318,7 @@ async function handleMessage(message: ExtensionMessage): Promise<MessageResponse
                     page_title,
                     video_start_time,
                     video_end_time,
+                    caption_text: caption_text || undefined,
                     priority: 1,
                     attachments: [
                         { s3_url, file_type: 'VIDEO_KEYFRAME', file_name: 'keyframe.jpg' },

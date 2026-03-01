@@ -102,10 +102,11 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
             name: newProjectName.trim(),
         });
 
-        if (res?.success) {
+        if (res?.success && res.data?.project_id) {
             setNewProjectName('');
             setShowCreateForm(false);
-            await fetchProjects(); // refresh the project list
+            handleProjectChange(res.data.project_id); // switch to the new workspace immediately
+            await fetchProjects(); // then refresh the project list
         } else {
             setCreateError(res?.error ?? 'Failed to create workspace.');
         }
