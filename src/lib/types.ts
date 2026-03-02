@@ -33,8 +33,8 @@ export interface Capture {
 }
 
 export interface PresignedUrlResponse {
-    upload_url: string;
-    s3_url: string;
+    url: string;   // pre-signed PUT URL for the S3 upload
+    key: string;   // S3 object key — pass as `s3_url` in the ingest attachment
 }
 
 export type CaptureType =
@@ -114,9 +114,9 @@ export interface IngestVideoMessage extends BaseMessage {
         source_url: string;
         page_title: string;
         video_start_time: number;
-        video_end_time: number;
+        video_end_time: number; // always startTime + 5 — backend slices ±15s transcript window
         base64Frame: string;
-        caption_text?: string; // live subtitle text at moment of capture (for AI context)
+        text_content: string;  // transcript window from YouTube captions, or "" if unavailable
     };
 }
 

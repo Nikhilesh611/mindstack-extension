@@ -86,11 +86,11 @@ export default function VaultPanel({ activeSessionId, projectId }: VaultPanelPro
                 throw new Error(presignedRes?.error ?? 'Failed to get upload URL.');
             }
 
-            const { upload_url, s3_url } = presignedRes.data;
+            const { url: uploadUrl, key: s3Url } = presignedRes.data;
 
-            // Step 2: PUT file directly to S3 from the Popup (Fix ②: avoids message size limit)
+            // Step 2: PUT file directly to S3 from the Popup (avoids message size limit)
             setUploadProgress('Uploading to vault...');
-            const putRes = await fetch(upload_url, {
+            const putRes = await fetch(uploadUrl, {
                 method: 'PUT',
                 headers: { 'Content-Type': file.type },
                 body: file,
@@ -102,6 +102,8 @@ export default function VaultPanel({ activeSessionId, projectId }: VaultPanelPro
 
             // Step 3: Ingest the capture via background
             setUploadProgress('Registering capture...');
+            const publicS3Url = uploadUrl.split('?')[0];
+
             const ingestRes = await sendMsg<{ capture_id: string }>({
                 type: 'INGEST_BROWSER',
                 payload: {
@@ -109,7 +111,7 @@ export default function VaultPanel({ activeSessionId, projectId }: VaultPanelPro
                     project_id: projectId,
                     capture_type: 'RESOURCE_UPLOAD',
                     priority: 5,
-                    attachments: [{ s3_url, file_type: fileType, file_name: file.name }],
+                    attachments: [{ s3_url: publicS3Url, file_type: fileType, file_name: file.name }],
                 },
             });
 
@@ -125,7 +127,7 @@ export default function VaultPanel({ activeSessionId, projectId }: VaultPanelPro
                 await sendMsg({
                     type: 'PROCESS_DOCUMENT',
                     capture_id: captureId,
-                    s3_url,
+                    s3_url: s3Url,
                 });
             }
 

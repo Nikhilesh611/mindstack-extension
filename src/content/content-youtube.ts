@@ -92,7 +92,7 @@ function captureKeyframe(video: HTMLVideoElement): string | null {
 /**
  * Extracts the current caption/subtitle text visible on screen.
  * YouTube renders captions inside .ytp-caption-segment spans.
- * This gives the AI the spoken words at the moment of capture.
+ * Used as a fast fallback when the timed transcript fetch fails.
  */
 function extractCaptions(): string {
     const segments = document.querySelectorAll('.ytp-caption-segment');
@@ -101,6 +101,115 @@ function extractCaptions(): string {
         .map((s) => s.textContent?.trim() ?? '')
         .filter(Boolean)
         .join(' ');
+}
+
+// ---------------------------------------------------------------------------
+// Transcript extraction via page-world script injection
+// ---------------------------------------------------------------------------
+
+/**
+ * MV3 content scripts run in an isolated JS world and cannot read page
+ * variables like `ytInitialPlayerResponse`. We bridge this by injecting a
+ * one-shot <script> element that runs in the MAIN world, reads the caption
+ * track URL, and posts it back via window.postMessage.
+ */
+function getYouTubeCaptionTrackUrl(): Promise<string | null> {
+    return new Promise((resolve) => {
+        const requestId = Math.random().toString(36).slice(2);
+
+        const handler = (event: MessageEvent) => {
+            if (event.source !== window) return;
+            if (event.data?.type !== 'MS_CAPTION_URL' || event.data?.id !== requestId) return;
+            window.removeEventListener('message', handler);
+            clearTimeout(timeout);
+            resolve((event.data.url as string | null) ?? null);
+        };
+        window.addEventListener('message', handler);
+
+        // Give the injected script 1 second to respond before giving up
+        const timeout = setTimeout(() => {
+            window.removeEventListener('message', handler);
+            resolve(null);
+        }, 1000);
+
+        const script = document.createElement('script');
+        script.textContent = `
+(function() {
+  try {
+    var tracks = window
+      && window.ytInitialPlayerResponse
+      && window.ytInitialPlayerResponse.captions
+      && window.ytInitialPlayerResponse.captions.playerCaptionsTracklistRenderer
+      && window.ytInitialPlayerResponse.captions.playerCaptionsTracklistRenderer.captionTracks;
+    var url = (tracks && tracks.length > 0) ? tracks[0].baseUrl : null;
+    window.postMessage({ type: 'MS_CAPTION_URL', id: '${requestId}', url: url }, '*');
+  } catch(e) {
+    window.postMessage({ type: 'MS_CAPTION_URL', id: '${requestId}', url: null }, '*');
+  }
+})();
+        `;
+        document.documentElement.appendChild(script);
+        script.remove();
+    });
+}
+
+/**
+ * Fetches a time-windowed slice of the YouTube transcript.
+ *
+ * YouTube's timedtext JSON3 format provides millisecond-precise cue events.
+ * We request a `windowSec`-wide window centred on `captureTimeSec`.
+ *
+ * Fallback chain:
+ *   1. ytInitialPlayerResponse caption track (full timed JSON3)  ← this function
+ *   2. DOM captions (.ytp-caption-segment)                        ← extractCaptions()
+ *   3. "" → backend Python scraper takes over
+ */
+async function fetchTranscriptWindow(
+    captureTimeSec: number,
+    windowSec = 60,
+): Promise<string> {
+    try {
+        const trackUrl = await getYouTubeCaptionTrackUrl();
+        if (!trackUrl) {
+            console.log('[MindStack YT] No caption track URL — falling back to DOM captions.');
+            return '';
+        }
+
+        const res = await fetch(`${trackUrl}&fmt=json3`);
+        if (!res.ok) return '';
+
+        const data = await res.json() as {
+            events?: Array<{
+                tStartMs?: number;
+                dDurationMs?: number;
+                segs?: Array<{ utf8?: string }>;
+            }>;
+        };
+
+        if (!Array.isArray(data.events) || data.events.length === 0) return '';
+
+        const halfWindowMs = (windowSec / 2) * 1000;
+        const captureMs = captureTimeSec * 1000;
+        const rangeStartMs = captureMs - halfWindowMs;
+        const rangeEndMs = captureMs + halfWindowMs;
+
+        const text = data.events
+            .filter((e) => {
+                if (e.tStartMs === undefined) return false;
+                return e.tStartMs >= rangeStartMs && e.tStartMs <= rangeEndMs;
+            })
+            .flatMap((e) => e.segs ?? [])
+            .map((s) => s.utf8 ?? '')
+            .join('')
+            .replace(/\n/g, ' ')
+            .trim();
+
+        console.log(`[MindStack YT] Transcript window: ${text.length} chars (±${windowSec / 2}s around ${captureTimeSec.toFixed(1)}s)`);
+        return text;
+    } catch (e) {
+        console.warn('[MindStack YT] Transcript fetch failed:', e);
+        return '';
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,13 +235,16 @@ async function getActiveSession(): Promise<{ sessionId: string; projectId: strin
 async function sendVideoSegment(
     video: HTMLVideoElement,
     startTime: number,
-    endTime: number,
+    _endTime: number,           // kept for call-site compat; not sent to backend
     preCapturedFrame?: string | null,
-    preCapturedCaptions?: string,
+    _preCapturedCaptions?: string, // retained for call-site compat; backend fetches transcript
 ): Promise<void> {
-    const segDuration = endTime - startTime;
-    if (segDuration < MIN_SEGMENT_DURATION_SEC) {
-        console.log(`[MindStack YT] Segment too short (${segDuration.toFixed(1)}s) — skipped.`);
+    // We need at least MIN_SEGMENT_DURATION_SEC of real watched time before firing,
+    // but the backend timestamp window is always startTime → startTime+5 so it can
+    // slice a precise ±15 s transcript buffer.
+    const watchedDuration = _endTime - startTime;
+    if (watchedDuration < MIN_SEGMENT_DURATION_SEC) {
+        console.log(`[MindStack YT] Segment too short (${watchedDuration.toFixed(1)}s) — skipped.`);
         return;
     }
 
@@ -142,9 +254,26 @@ async function sendVideoSegment(
         return;
     }
 
-    // Use caller-supplied frame/captions, or fall back to capturing now (best-effort)
+    // Capture frame synchronously (caller should have pre-captured; fall back just in case)
     const base64Frame = preCapturedFrame ?? captureKeyframe(video) ?? '';
-    const caption_text = preCapturedCaptions ?? extractCaptions();
+
+    // ── Transcript extraction (3-level fallback) ──────────────────────────────
+    // 1. Full timed transcript from YouTube's caption track (best quality)
+    // 2. DOM-visible subtitle text at the moment of capture (fast fallback)
+    // 3. "" — backend Python microservice will attempt its own fetch
+    let text_content = await fetchTranscriptWindow(startTime);
+    if (!text_content) {
+        text_content = extractCaptions();
+        if (text_content) {
+            console.log(`[MindStack YT] Using DOM captions as fallback: "${text_content.slice(0, 60)}…"`);
+        }
+    }
+
+    // video_end_time = startTime + 5 seconds (decimal, not floored).
+    // The backend adds ±15 s buffer around this window automatically,
+    // giving the LLM exactly ~30 s of transcript context.
+    const captureStartTime = startTime;
+    const captureEndTime = startTime + 5;
 
     const payload = {
         type: 'INGEST_VIDEO' as const,
@@ -153,12 +282,18 @@ async function sendVideoSegment(
             project_id: session.projectId,
             source_url: window.location.href,
             page_title: document.title,
-            video_start_time: Math.floor(startTime),
-            video_end_time: Math.floor(endTime),
+            video_start_time: captureStartTime,
+            video_end_time: captureEndTime,
             base64Frame,
-            caption_text,  // spoken words at the moment of capture
+            text_content,
         },
     };
+
+    console.log(
+        `[MindStack YT] Sending capture — watched ${watchedDuration.toFixed(1)}s, ` +
+        `keyframe window: ${captureStartTime.toFixed(1)}s → ${captureEndTime.toFixed(1)}s, ` +
+        `transcript: ${text_content.length} chars`,
+    );
 
     chrome.runtime.sendMessage(payload, (response) => {
         // Guard against MV3 service worker being idle (chrome.runtime.lastError must be read)
@@ -171,6 +306,7 @@ async function sendVideoSegment(
             injectToast(`Captured — ${title}`);
         } else {
             console.warn('[MindStack YT] Video ingest failed:', response?.error);
+            injectToast(`Capture failed — ${response?.error ?? 'unknown error'}`);
         }
     });
 }
