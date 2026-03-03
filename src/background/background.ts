@@ -475,8 +475,16 @@ async function handleMessage(message: ExtensionMessage, sender?: chrome.runtime.
                     world: 'MAIN',
                     func: () => {
                         try {
-                            const w = window as any;
-                            const tracks = w?.ytInitialPlayerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+                            const playerComponent = document.querySelector('ytd-player') as any;
+                            let playerResponse = typeof playerComponent?.getPlayerResponse === 'function'
+                                ? playerComponent.getPlayerResponse()
+                                : null;
+
+                            if (!playerResponse) {
+                                playerResponse = (window as any)?.ytInitialPlayerResponse;
+                            }
+
+                            const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
                             return (tracks && tracks.length > 0) ? (tracks[0].baseUrl as string) : null;
                         } catch (e) {
                             return null;
