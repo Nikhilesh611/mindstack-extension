@@ -169,7 +169,10 @@ async function fetchTranscriptWindow(
         const text = data.events
             .filter((e) => {
                 if (e.tStartMs === undefined) return false;
-                return e.tStartMs >= rangeStartMs && e.tStartMs <= rangeEndMs;
+                const captionStartMs = e.tStartMs;
+                const captionEndMs = captionStartMs + (e.dDurationMs ?? 0);
+                // True overlap: caption starts before segment ends AND caption ends after segment starts
+                return captionStartMs <= rangeEndMs && captionEndMs >= rangeStartMs;
             })
             .flatMap((e) => e.segs ?? [])
             .map((s) => s.utf8 ?? '')
