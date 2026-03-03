@@ -65,7 +65,8 @@ export type MessageType =
     | 'GET_PRESIGNED_URL'
     | 'GET_CAPTURES'
     | 'DELETE_CAPTURE'
-    | 'PROCESS_DOCUMENT';
+    | 'PROCESS_DOCUMENT'
+    | 'GET_YT_CAPTION_URL';
 
 export interface BaseMessage {
     type: MessageType;
@@ -114,9 +115,9 @@ export interface IngestVideoMessage extends BaseMessage {
         source_url: string;
         page_title: string;
         video_start_time: number;
-        video_end_time: number; // always startTime + 5 — backend slices ±15s transcript window
+        video_end_time: number; // represents the end of the segment watched
         base64Frame: string;
-        text_content: string;  // transcript window from YouTube captions, or "" if unavailable
+        caption_text?: string; // live subtitle text at moment of capture (for AI context)
     };
 }
 
@@ -142,6 +143,10 @@ export interface ProcessDocumentMessage extends BaseMessage {
     s3_url: string;
 }
 
+export interface GetYTCaptionUrlMessage extends BaseMessage {
+    type: 'GET_YT_CAPTION_URL';
+}
+
 export type ExtensionMessage =
     | GetProjectsMessage
     | CreateProjectMessage
@@ -152,7 +157,8 @@ export type ExtensionMessage =
     | GetPresignedUrlMessage
     | GetCapturesMessage
     | DeleteCaptureMessage
-    | ProcessDocumentMessage;
+    | ProcessDocumentMessage
+    | GetYTCaptionUrlMessage;
 
 // ─────────────────────────────────────────────
 // Generic Response Wrapper

@@ -204,8 +204,8 @@ chrome.runtime.onStartup.addListener(async () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener(
-    (message: ExtensionMessage, _sender, sendResponse) => {
-        handleMessage(message)
+    (message: ExtensionMessage, sender, sendResponse) => {
+        handleMessage(message, sender)
             .then((response) => sendResponse(response))
             .catch((err) =>
                 sendResponse({
@@ -218,7 +218,7 @@ chrome.runtime.onMessage.addListener(
     }
 );
 
-async function handleMessage(message: ExtensionMessage): Promise<MessageResponse> {
+async function handleMessage(message: ExtensionMessage, sender?: chrome.runtime.MessageSender): Promise<MessageResponse> {
     switch (message.type) {
         // ── GET_PROJECTS ─────────────────────────────────────────────
         case 'GET_PROJECTS': {
@@ -397,7 +397,7 @@ async function handleMessage(message: ExtensionMessage): Promise<MessageResponse
                     // Backend currently accepts `caption_text` (not `text_content` yet).
                     // We populate it with our extracted transcript window for richer context.
                     // Update this to `text_content` once the backend schema is updated.
-                    caption_text: message.payload.text_content || undefined,
+                    caption_text: message.payload.caption_text || undefined,
                     // Round to integers — backend schema expects whole seconds
                     video_start_time: Math.round(video_start_time),
                     video_end_time: Math.round(video_end_time),
@@ -460,6 +460,34 @@ async function handleMessage(message: ExtensionMessage): Promise<MessageResponse
                 body: { capture_id: message.capture_id, s3_url: message.s3_url },
             });
             return { success: result.ok, error: result.error ?? undefined };
+        }
+
+        // ── GET_YT_CAPTION_URL ─────────────────────────────────────────
+        case 'GET_YT_CAPTION_URL': {
+            const tabId = sender?.tab?.id;
+            if (!tabId) {
+                return { success: false, error: 'No active tab ID available' };
+            }
+
+            try {
+                const results = await chrome.scripting.executeScript({
+                    target: { tabId },
+                    world: 'MAIN',
+                    func: () => {
+                        try {
+                            const w = window as any;
+                            const tracks = w?.ytInitialPlayerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+                            return (tracks && tracks.length > 0) ? (tracks[0].baseUrl as string) : null;
+                        } catch (e) {
+                            return null;
+                        }
+                    }
+                });
+                return { success: true, data: { url: results[0]?.result ?? null } };
+            } catch (err) {
+                console.error('[MindStack BG] executeScript failed:', err);
+                return { success: false, error: err instanceof Error ? err.message : String(err) };
+            }
         }
 
         default: {

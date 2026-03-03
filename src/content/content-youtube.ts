@@ -115,41 +115,14 @@ function extractCaptions(): string {
  */
 function getYouTubeCaptionTrackUrl(): Promise<string | null> {
     return new Promise((resolve) => {
-        const requestId = Math.random().toString(36).slice(2);
-
-        const handler = (event: MessageEvent) => {
-            if (event.source !== window) return;
-            if (event.data?.type !== 'MS_CAPTION_URL' || event.data?.id !== requestId) return;
-            window.removeEventListener('message', handler);
-            clearTimeout(timeout);
-            resolve((event.data.url as string | null) ?? null);
-        };
-        window.addEventListener('message', handler);
-
-        // Give the injected script 1 second to respond before giving up
-        const timeout = setTimeout(() => {
-            window.removeEventListener('message', handler);
-            resolve(null);
-        }, 1000);
-
-        const script = document.createElement('script');
-        script.textContent = `
-(function() {
-  try {
-    var tracks = window
-      && window.ytInitialPlayerResponse
-      && window.ytInitialPlayerResponse.captions
-      && window.ytInitialPlayerResponse.captions.playerCaptionsTracklistRenderer
-      && window.ytInitialPlayerResponse.captions.playerCaptionsTracklistRenderer.captionTracks;
-    var url = (tracks && tracks.length > 0) ? tracks[0].baseUrl : null;
-    window.postMessage({ type: 'MS_CAPTION_URL', id: '${requestId}', url: url }, '*');
-  } catch(e) {
-    window.postMessage({ type: 'MS_CAPTION_URL', id: '${requestId}', url: null }, '*');
-  }
-})();
-        `;
-        document.documentElement.appendChild(script);
-        script.remove();
+        chrome.runtime.sendMessage({ type: 'GET_YT_CAPTION_URL' }, (response) => {
+            if (chrome.runtime.lastError) {
+                console.warn('[MindStack YT] getYouTubeCaptionTrackUrl error:', chrome.runtime.lastError.message);
+                resolve(null);
+            } else {
+                resolve(response?.data?.url ?? null);
+            }
+        });
     });
 }
 
@@ -261,7 +234,11 @@ async function sendVideoSegment(
     // 1. Full timed transcript from YouTube's caption track (best quality)
     // 2. DOM-visible subtitle text at the moment of capture (fast fallback)
     // 3. "" — backend Python microservice will attempt its own fetch
-    let text_content = await fetchTranscriptWindow(startTime);
+    const segmentDuration = _endTime - startTime;
+    const segmentCenter = startTime + (segmentDuration / 2);
+
+    // We pass the segment center and the total duration watched to get a transcript covering the entire segment
+    let text_content = await fetchTranscriptWindow(segmentCenter, segmentDuration);
     if (!text_content) {
         text_content = extractCaptions();
         if (text_content) {
@@ -269,11 +246,9 @@ async function sendVideoSegment(
         }
     }
 
-    // video_end_time = startTime + 5 seconds (decimal, not floored).
-    // The backend adds ±15 s buffer around this window automatically,
-    // giving the LLM exactly ~30 s of transcript context.
+    // We use the full segment bounds for timestamps.
     const captureStartTime = startTime;
-    const captureEndTime = startTime + 5;
+    const captureEndTime = _endTime;
 
     const payload = {
         type: 'INGEST_VIDEO' as const,
@@ -285,7 +260,7 @@ async function sendVideoSegment(
             video_start_time: captureStartTime,
             video_end_time: captureEndTime,
             base64Frame,
-            text_content,
+            caption_text: text_content,
         },
     };
 
