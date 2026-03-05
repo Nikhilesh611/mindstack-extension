@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import type { Project } from '../../lib/types';
+import type { Project, Workspace } from '../../lib/types';
 import VaultPanel from './VaultPanel';
 import LiveFeed from './LiveFeed';
 
@@ -9,11 +9,15 @@ interface CommandCenterProps {
 
 type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
 
+// Represents whatever is selected in the unified workspace/project dropdown.
+type ContextType = 'project' | 'workspace';
+interface SelectedContext {
+    id: string;
+    type: ContextType;
+    name: string;
+}
+
 // Robust sendMsg — handles MV3 service-worker sleep/wake cycle.
-// When the background SW is sleeping, Chrome fires the callback with
-// `undefined` and sets chrome.runtime.lastError. We read lastError to
-// suppress the unchecked-error console noise, then retry once after a
-// short delay (giving Chrome time to restart the SW).
 function sendMsg<T>(msg: unknown): Promise<{ success: boolean; data?: T; error?: string }> {
     return new Promise((resolve) => {
         chrome.runtime.sendMessage(msg, (response) => {
@@ -37,11 +41,12 @@ function sendMsg<T>(msg: unknown): Promise<{ success: boolean; data?: T; error?:
 
 export default function CommandCenter({ onLogout }: CommandCenterProps) {
     const [projects, setProjects] = useState<Project[]>([]);
-    const [selectedProjectId, setSelectedProjectId] = useState<string>('');
+    const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+    const [selectedContext, setSelectedContext] = useState<SelectedContext | null>(null);
     const [sessionState, setSessionState] = useState<SessionState>('idle');
     const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-    const [loadingProjects, setLoadingProjects] = useState(true);
-    const [projectError, setProjectError] = useState<string | null>(null);
+    const [loadingData, setLoadingData] = useState(true);
+    const [dataError, setDataError] = useState<string | null>(null);
     const [statusMsg, setStatusMsg] = useState<string | null>(null);
     const [activeTab, setActiveTab] = useState<'feed' | 'vault'>('feed');
 
@@ -54,42 +59,75 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
     // Load initial state from storage
     useEffect(() => {
         chrome.storage.local.get(
-            ['mindstack_session_id', 'mindstack_project_id'],
+            ['mindstack_session_id', 'mindstack_project_id', 'mindstack_workspace_id'],
             (result) => {
                 const sid = result['mindstack_session_id'] as string | undefined;
                 const pid = result['mindstack_project_id'] as string | undefined;
+                const wid = result['mindstack_workspace_id'] as string | undefined;
                 if (sid) {
                     setActiveSessionId(sid);
                     setSessionState('active');
                 }
-                if (pid) setSelectedProjectId(pid);
+                if (pid) {
+                    setSelectedContext({ id: pid, type: 'project', name: '' }); // name patched after fetch
+                } else if (wid) {
+                    setSelectedContext({ id: wid, type: 'workspace', name: '' }); // name patched after fetch
+                }
             }
         );
     }, []);
 
-    const fetchProjects = async () => {
-        setLoadingProjects(true);
-        setProjectError(null);
-        const res = await sendMsg<Project[]>({ type: 'GET_PROJECTS' });
-        if (res?.success && Array.isArray(res.data)) {
-            setProjects(res.data);
-            setSelectedProjectId((prev) => {
-                if (!prev && res.data && res.data.length > 0) {
-                    const firstId = res.data[0].id;
-                    chrome.storage.local.set({ mindstack_project_id: firstId });
-                    return firstId;
+    const fetchAllData = async () => {
+        setLoadingData(true);
+        setDataError(null);
+
+        const [projectsRes, workspacesRes] = await Promise.all([
+            sendMsg<Project[]>({ type: 'GET_PROJECTS' }),
+            sendMsg<Workspace[]>({ type: 'GET_WORKSPACES' }),
+        ]);
+
+        const fetchedProjects: Project[] = (projectsRes?.success && Array.isArray(projectsRes.data)) ? projectsRes.data : [];
+        const fetchedWorkspaces: Workspace[] = (workspacesRes?.success && Array.isArray(workspacesRes.data)) ? workspacesRes.data : [];
+
+        setProjects(fetchedProjects);
+        setWorkspaces(fetchedWorkspaces);
+
+        // Patch the name of the stored context now that we have the lists
+        setSelectedContext((prev) => {
+            if (!prev) {
+                // Nothing in storage — auto-select the first available item
+                if (fetchedProjects.length > 0) {
+                    const first = fetchedProjects[0];
+                    chrome.storage.local.set({ mindstack_project_id: first.id });
+                    return { id: first.id, type: 'project', name: first.name };
                 }
-                return prev;
-            });
-        } else {
-            setProjectError(res?.error ?? 'Failed to load workspaces.');
+                if (fetchedWorkspaces.length > 0) {
+                    const first = fetchedWorkspaces[0];
+                    chrome.storage.local.set({ mindstack_workspace_id: first.id });
+                    return { id: first.id, type: 'workspace', name: first.name };
+                }
+                return null;
+            }
+
+            // Patch name for existing selection
+            if (prev.type === 'project') {
+                const match = fetchedProjects.find((p) => p.id === prev.id);
+                return match ? { ...prev, name: match.name } : prev;
+            } else {
+                const match = fetchedWorkspaces.find((w) => w.id === prev.id);
+                return match ? { ...prev, name: match.display_name || match.name } : prev;
+            }
+        });
+
+        if (!projectsRes?.success && !workspacesRes?.success) {
+            setDataError('Failed to load projects and workspaces.');
         }
-        setLoadingProjects(false);
+
+        setLoadingData(false);
     };
 
-    // Fetch projects on mount
     useEffect(() => {
-        fetchProjects();
+        fetchAllData();
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleCreateProject = async () => {
@@ -103,30 +141,47 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
         });
 
         if (res?.success && res.data?.project_id) {
+            const newId = res.data.project_id;
             setNewProjectName('');
             setShowCreateForm(false);
-            handleProjectChange(res.data.project_id); // switch to the new workspace immediately
-            await fetchProjects(); // then refresh the project list
+            // Switch to the new project immediately
+            const newCtx: SelectedContext = { id: newId, type: 'project', name: newProjectName.trim() };
+            setSelectedContext(newCtx);
+            chrome.storage.local.set({ mindstack_project_id: newId });
+            chrome.storage.local.remove('mindstack_workspace_id');
+            await fetchAllData(); // refresh to get full project data
         } else {
             setCreateError(res?.error ?? 'Failed to create workspace.');
         }
         setCreateLoading(false);
     };
 
-    const handleProjectChange = (projectId: string) => {
-        setSelectedProjectId(projectId);
-        chrome.storage.local.set({ mindstack_project_id: projectId });
+    const handleContextChange = (id: string, type: ContextType) => {
+        const project = type === 'project' ? projects.find((p) => p.id === id) : null;
+        const workspace = type === 'workspace' ? workspaces.find((w) => w.id === id) : null;
+        const name = project?.name ?? workspace?.display_name ?? workspace?.name ?? '';
+
+        setSelectedContext({ id, type, name });
+
+        if (type === 'project') {
+            chrome.storage.local.set({ mindstack_project_id: id });
+            chrome.storage.local.remove('mindstack_workspace_id');
+        } else {
+            chrome.storage.local.set({ mindstack_workspace_id: id });
+            chrome.storage.local.remove('mindstack_project_id');
+        }
     };
 
     const handleStartSession = async () => {
-        if (!selectedProjectId) return;
+        if (!selectedContext) return;
         setSessionState('starting');
         setStatusMsg(null);
 
-        const res = await sendMsg<{ session_id: string }>({
-            type: 'START_SESSION',
-            project_id: selectedProjectId,
-        });
+        const msg = selectedContext.type === 'workspace'
+            ? { type: 'START_SESSION', workspace_id: selectedContext.id, project_id: null }
+            : { type: 'START_SESSION', project_id: selectedContext.id, workspace_id: null };
+
+        const res = await sendMsg<{ session_id: string }>(msg);
 
         if (res?.success && res.data?.session_id) {
             setActiveSessionId(res.data.session_id);
@@ -152,11 +207,13 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
             'mindstack_jwt',
             'mindstack_session_id',
             'mindstack_project_id',
+            'mindstack_workspace_id',
         ]);
         onLogout();
     };
 
     const isSessionActive = sessionState === 'active';
+    const hasItems = projects.length > 0 || workspaces.length > 0;
 
     return (
         <div className="flex flex-col w-full bg-ghost-bg min-h-screen animate-fade-in">
@@ -181,7 +238,7 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
                 </button>
             </div>
 
-            {/* ── Project Selector ── */}
+            {/* ── Project / Workspace Selector ── */}
             <div className="px-4 pt-3 pb-2">
                 <div className="flex items-center justify-between mb-1.5">
                     <label className="ghost-label">Workspace</label>
@@ -189,7 +246,7 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
                         onClick={() => { setShowCreateForm((v) => !v); setCreateError(null); }}
                         className="font-mono text-[10px] text-ghost-accent hover:text-ghost-accent/80 transition-colors"
                     >
-                        {showCreateForm ? '✕ cancel' : '+ new'}
+                        {showCreateForm ? '✕ cancel' : '+ new project'}
                     </button>
                 </div>
 
@@ -199,7 +256,7 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
                         <input
                             type="text"
                             className="ghost-input"
-                            placeholder="Workspace name..."
+                            placeholder="Project name..."
                             value={newProjectName}
                             onChange={(e) => setNewProjectName(e.target.value)}
                             onKeyDown={(e) => e.key === 'Enter' && handleCreateProject()}
@@ -218,43 +275,62 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
                                     <div className="w-3 h-3 border border-ghost-bg border-t-transparent rounded-full animate-spin" />
                                     Creating...
                                 </span>
-                            ) : '→ Create Workspace'}
+                            ) : '→ Create Project'}
                         </button>
                     </div>
                 )}
 
-                {loadingProjects ? (
+                {loadingData ? (
                     <div className="ghost-input flex items-center gap-2 text-ghost-muted">
                         <div className="w-3 h-3 border border-ghost-muted border-t-transparent rounded-full animate-spin" />
                         Loading workspaces...
                     </div>
-                ) : projectError ? (
-                    <div className="text-ghost-red font-mono text-xs">{projectError}</div>
-                ) : projects.length === 0 ? (
-                    /* Fix ③: Zero-projects onboarding state — now with inline creation */
+                ) : dataError ? (
+                    <div className="text-ghost-red font-mono text-xs">{dataError}</div>
+                ) : !hasItems ? (
                     <div className="ghost-card border-ghost-accent/30 bg-ghost-accent/5 animate-fade-in text-center py-3">
-                        <p className="font-mono text-xs text-ghost-text mb-1">No workspaces yet.</p>
+                        <p className="font-mono text-xs text-ghost-text mb-1">No projects or workspaces yet.</p>
                         <p className="font-mono text-[10px] text-ghost-muted">
-                            Click <span className="text-ghost-accent">+ new</span> above to create one.
+                            Click <span className="text-ghost-accent">+ new project</span> above to create one.
                         </p>
                     </div>
                 ) : (
                     <select
-                        value={selectedProjectId}
-                        onChange={(e) => handleProjectChange(e.target.value)}
+                        value={selectedContext ? `${selectedContext.type}:${selectedContext.id}` : ''}
+                        onChange={(e) => {
+                            const [type, id] = e.target.value.split(':') as [ContextType, string];
+                            handleContextChange(id, type);
+                        }}
                         className="ghost-input cursor-pointer"
                     >
-                        {projects.map((p) => (
-                            <option key={p.id} value={p.id} className="bg-ghost-surface">
-                                {p.name}
-                            </option>
-                        ))}
+                        {/* ── Personal Projects section ── */}
+                        {projects.length > 0 && (
+                            <optgroup label="Personal Projects">
+                                {projects.map((p) => (
+                                    <option key={p.id} value={`project:${p.id}`} className="bg-ghost-surface">
+                                        {p.name}
+                                    </option>
+                                ))}
+                            </optgroup>
+                        )}
+
+                        {/* ── Team Workspaces section ── */}
+                        {workspaces.length > 0 && (
+                            <optgroup label="Team Workspaces">
+                                {workspaces.map((w) => (
+                                    <option key={w.id} value={`workspace:${w.id}`} className="bg-ghost-surface">
+                                        {w.display_name || w.name}
+                                        {w.role ? ` (${w.role})` : ''}
+                                    </option>
+                                ))}
+                            </optgroup>
+                        )}
                     </select>
                 )}
             </div>
 
-            {/* ── Session Control ── (only if projects exist) */}
-            {projects.length > 0 && (
+            {/* ── Session Control ── (only if items exist) */}
+            {hasItems && selectedContext && (
                 <div className="px-4 pb-3">
                     {sessionState === 'idle' && (
                         <button
@@ -292,7 +368,7 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
             )}
 
             {/* ── Tab Bar ── */}
-            {projects.length > 0 && (
+            {hasItems && selectedContext && (
                 <>
                     <div className="flex border-b border-ghost-border">
                         {(['feed', 'vault'] as const).map((tab) => (
@@ -312,13 +388,15 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
                     <div className="flex-1 overflow-y-auto">
                         {activeTab === 'feed' ? (
                             <LiveFeed
-                                projectId={selectedProjectId}
+                                projectId={selectedContext.type === 'project' ? selectedContext.id : null}
+                                workspaceId={selectedContext.type === 'workspace' ? selectedContext.id : null}
                                 activeSessionId={activeSessionId}
                             />
                         ) : (
                             <VaultPanel
                                 activeSessionId={activeSessionId}
-                                projectId={selectedProjectId}
+                                projectId={selectedContext.type === 'project' ? selectedContext.id : null}
+                                workspaceId={selectedContext.type === 'workspace' ? selectedContext.id : null}
                             />
                         )}
                     </div>

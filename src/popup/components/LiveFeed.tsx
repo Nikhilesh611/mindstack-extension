@@ -2,12 +2,12 @@ import { useState, useEffect, useCallback } from 'react';
 import type { Capture, MessageResponse } from '../../lib/types';
 
 interface LiveFeedProps {
-    projectId: string;
+    projectId: string | null;
+    workspaceId: string | null;
     activeSessionId: string | null;
 }
 
 // Robust sendMsg — handles MV3 service-worker sleep/wake cycle.
-// Reads lastError and retries once after 200ms if the SW was asleep.
 function sendMsg<T>(msg: unknown): Promise<MessageResponse<T>> {
     return new Promise((resolve) => {
         chrome.runtime.sendMessage(msg, (response) => {
@@ -43,21 +43,25 @@ function timeAgo(isoString: string): string {
     return `${Math.floor(delta / 86400)}d ago`;
 }
 
-export default function LiveFeed({ projectId, activeSessionId }: LiveFeedProps) {
+export default function LiveFeed({ projectId, workspaceId, activeSessionId }: LiveFeedProps) {
     const [captures, setCaptures] = useState<Capture[]>([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
 
     const fetchCaptures = useCallback(async () => {
-        if (!projectId) return;
+        if (!projectId && !workspaceId) return;
         setLoading(true);
         setError(null);
 
-        const res = await sendMsg<Capture[]>({ type: 'GET_CAPTURES', project_id: projectId });
+        const res = await sendMsg<Capture[]>({
+            type: 'GET_CAPTURES',
+            project_id: projectId ?? null,
+            workspace_id: workspaceId ?? null,
+        });
 
         if (res?.success && Array.isArray(res.data)) {
-            // Filter to active session only, then take top 5 newest
+            // Filter to active session only (if session is running), then take top 5 newest
             const filtered = activeSessionId
                 ? res.data.filter((c) => c.session_id === activeSessionId)
                 : res.data;
@@ -66,7 +70,7 @@ export default function LiveFeed({ projectId, activeSessionId }: LiveFeedProps) 
             setError(res?.error ?? 'Failed to load captures.');
         }
         setLoading(false);
-    }, [projectId, activeSessionId]);
+    }, [projectId, workspaceId, activeSessionId]);
 
     // Fetch on mount and every 30s
     useEffect(() => {
@@ -148,7 +152,7 @@ export default function LiveFeed({ projectId, activeSessionId }: LiveFeedProps) 
                             <span className="text-base shrink-0 mt-0.5">{meta.icon}</span>
 
                             <div className="flex-1 min-w-0">
-                                <div className="flex items-center gap-1.5 mb-0.5">
+                                <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
                                     <span className={`font-mono text-[10px] font-semibold ${meta.color}`}>
                                         {meta.label}
                                     </span>
@@ -156,6 +160,15 @@ export default function LiveFeed({ projectId, activeSessionId }: LiveFeedProps) 
                                     <span className="font-mono text-[10px] text-ghost-muted">
                                         {timeAgo(capture.created_at)}
                                     </span>
+                                    {/* Teammate attribution badge (workspace captures) */}
+                                    {capture.author_display_name && (
+                                        <>
+                                            <span className="font-mono text-[10px] text-ghost-muted">·</span>
+                                            <span className="font-mono text-[10px] px-1.5 py-0.5 rounded-full bg-ghost-accent/10 border border-ghost-accent/25 text-ghost-accent">
+                                                👤 {capture.author_display_name}
+                                            </span>
+                                        </>
+                                    )}
                                 </div>
 
                                 {capture.page_title && (

@@ -14,12 +14,14 @@
  *   - On pause: immediate frame snapshot + segment send
  *   - Sends INGEST_VIDEO message to background (background handles S3 + ingest)
  *   - Injects stealth toast on success
+ *   - Workspace-aware: session is only active when BOTH session_id AND
+ *     (project_id OR workspace_id) are present in storage.
  */
 
-const MIN_SEGMENT_DURATION_SEC = 3;   // lower so short intervals aren't silently dropped
-const MAX_PERIODIC_CAPTURES = 10;  // max auto-captures per video session
-const MIN_CAPTURE_INTERVAL_MS = 30_000; // never fire faster than every 30 s
-const DURATION_RETRY_DELAY_MS = 1_500; // wait before retrying if video.duration is NaN
+const MIN_SEGMENT_DURATION_SEC = 3;
+const MAX_PERIODIC_CAPTURES = 10;
+const MIN_CAPTURE_INTERVAL_MS = 30_000;
+const DURATION_RETRY_DELAY_MS = 1_500;
 
 // ---------------------------------------------------------------------------
 // Toast
@@ -73,15 +75,11 @@ function injectToast(message: string): void {
 function captureKeyframe(video: HTMLVideoElement): string | null {
     try {
         const canvas = document.createElement('canvas');
-        // Use the video's native resolution for maximum AI legibility.
-        // videoWidth/Height are the actual decoded frame dimensions; fall back
-        // to 1280×720 only if they haven't been decoded yet.
         canvas.width = video.videoWidth || 1280;
         canvas.height = video.videoHeight || 720;
         const ctx = canvas.getContext('2d');
         if (!ctx) return null;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        // Higher quality (0.95) helps the AI read on-screen text and UI elements.
         return canvas.toDataURL('image/jpeg', 0.95);
     } catch (e) {
         console.warn('[MindStack YT] Canvas capture failed:', e);
@@ -91,8 +89,6 @@ function captureKeyframe(video: HTMLVideoElement): string | null {
 
 /**
  * Extracts the current caption/subtitle text visible on screen.
- * YouTube renders captions inside .ytp-caption-segment spans.
- * Used as a fast fallback when the timed transcript fetch fails.
  */
 function extractCaptions(): string {
     const segments = document.querySelectorAll('.ytp-caption-segment');
@@ -107,12 +103,6 @@ function extractCaptions(): string {
 // Transcript extraction via page-world script injection
 // ---------------------------------------------------------------------------
 
-/**
- * MV3 content scripts run in an isolated JS world and cannot read page
- * variables like `ytInitialPlayerResponse`. We bridge this by injecting a
- * one-shot <script> element that runs in the MAIN world, reads the caption
- * track URL, and posts it back via window.postMessage.
- */
 function getYouTubeCaptionTrackUrl(): Promise<string | null> {
     return new Promise((resolve) => {
         chrome.runtime.sendMessage({ type: 'GET_YT_CAPTION_URL' }, (response) => {
@@ -126,17 +116,6 @@ function getYouTubeCaptionTrackUrl(): Promise<string | null> {
     });
 }
 
-/**
- * Fetches a time-windowed slice of the YouTube transcript.
- *
- * YouTube's timedtext JSON3 format provides millisecond-precise cue events.
- * We request a `windowSec`-wide window centred on `captureTimeSec`.
- *
- * Fallback chain:
- *   1. ytInitialPlayerResponse caption track (full timed JSON3)  ← this function
- *   2. DOM captions (.ytp-caption-segment)                        ← extractCaptions()
- *   3. "" → backend Python scraper takes over
- */
 async function fetchTranscriptWindow(
     captureTimeSec: number,
     windowSec = 60,
@@ -171,7 +150,6 @@ async function fetchTranscriptWindow(
                 if (e.tStartMs === undefined) return false;
                 const captionStartMs = e.tStartMs;
                 const captionEndMs = captionStartMs + (e.dDurationMs ?? 0);
-                // True overlap: caption starts before segment ends AND caption ends after segment starts
                 return captionStartMs <= rangeEndMs && captionEndMs >= rangeStartMs;
             })
             .flatMap((e) => e.segs ?? [])
@@ -192,13 +170,30 @@ async function fetchTranscriptWindow(
 // Session helpers
 // ---------------------------------------------------------------------------
 
-async function getActiveSession(): Promise<{ sessionId: string; projectId: string } | null> {
+interface ActiveSession {
+    sessionId: string;
+    projectId: string | null;
+    workspaceId: string | null;
+}
+
+/**
+ * CRITICAL FIX: Session is only considered active when BOTH session_id AND
+ * at least one context ID (project_id OR workspace_id) are present in storage.
+ */
+async function getActiveSession(): Promise<ActiveSession | null> {
     return new Promise((resolve) => {
-        chrome.storage.local.get(['mindstack_session_id', 'mindstack_project_id'], (result) => {
-            const sessionId = result['mindstack_session_id'] as string | undefined;
-            const projectId = result['mindstack_project_id'] as string | undefined;
-            resolve(sessionId && projectId ? { sessionId, projectId } : null);
-        });
+        chrome.storage.local.get(
+            ['mindstack_session_id', 'mindstack_project_id', 'mindstack_workspace_id'],
+            (result) => {
+                const sessionId = result['mindstack_session_id'] as string | undefined;
+                const projectId = (result['mindstack_project_id'] as string | undefined) ?? null;
+                const workspaceId = (result['mindstack_workspace_id'] as string | undefined) ?? null;
+
+                // Must have session AND at least one of project or workspace
+                const isActive = !!(sessionId && (projectId || workspaceId));
+                resolve(isActive ? { sessionId: sessionId!, projectId, workspaceId } : null);
+            }
+        );
     });
 }
 
@@ -211,13 +206,10 @@ async function getActiveSession(): Promise<{ sessionId: string; projectId: strin
 async function sendVideoSegment(
     video: HTMLVideoElement,
     startTime: number,
-    _endTime: number,           // kept for call-site compat; not sent to backend
+    _endTime: number,
     preCapturedFrame?: string | null,
-    _preCapturedCaptions?: string, // retained for call-site compat; backend fetches transcript
+    _preCapturedCaptions?: string,
 ): Promise<void> {
-    // We need at least MIN_SEGMENT_DURATION_SEC of real watched time before firing,
-    // but the backend timestamp window is always startTime → startTime+5 so it can
-    // slice a precise ±15 s transcript buffer.
     const watchedDuration = _endTime - startTime;
     if (watchedDuration < MIN_SEGMENT_DURATION_SEC) {
         console.log(`[MindStack YT] Segment too short (${watchedDuration.toFixed(1)}s) — skipped.`);
@@ -230,17 +222,11 @@ async function sendVideoSegment(
         return;
     }
 
-    // Capture frame synchronously (caller should have pre-captured; fall back just in case)
     const base64Frame = preCapturedFrame ?? captureKeyframe(video) ?? '';
 
     // ── Transcript extraction (3-level fallback) ──────────────────────────────
-    // 1. Full timed transcript from YouTube's caption track (best quality)
-    // 2. DOM-visible subtitle text at the moment of capture (fast fallback)
-    // 3. "" — backend Python microservice will attempt its own fetch
     const segmentDuration = _endTime - startTime;
     const segmentCenter = startTime + (segmentDuration / 2);
-
-    // We pass the segment center and the total duration watched to get a transcript covering the entire segment
     let text_content = await fetchTranscriptWindow(segmentCenter, segmentDuration);
     if (!text_content) {
         text_content = extractCaptions();
@@ -249,7 +235,6 @@ async function sendVideoSegment(
         }
     }
 
-    // We use the full segment bounds for timestamps.
     const captureStartTime = startTime;
     const captureEndTime = _endTime;
 
@@ -258,6 +243,7 @@ async function sendVideoSegment(
         payload: {
             session_id: session.sessionId,
             project_id: session.projectId,
+            workspace_id: session.workspaceId,
             source_url: window.location.href,
             page_title: document.title,
             video_start_time: captureStartTime,
@@ -270,11 +256,11 @@ async function sendVideoSegment(
     console.log(
         `[MindStack YT] Sending capture — watched ${watchedDuration.toFixed(1)}s, ` +
         `keyframe window: ${captureStartTime.toFixed(1)}s → ${captureEndTime.toFixed(1)}s, ` +
-        `transcript: ${text_content.length} chars`,
+        `transcript: ${text_content.length} chars, ` +
+        `context: ${session.projectId ? `project:${session.projectId}` : `workspace:${session.workspaceId}`}`,
     );
 
     chrome.runtime.sendMessage(payload, (response) => {
-        // Guard against MV3 service worker being idle (chrome.runtime.lastError must be read)
         if (chrome.runtime.lastError) {
             console.warn('[MindStack YT] sendMessage error:', chrome.runtime.lastError.message);
             return;
@@ -296,7 +282,7 @@ async function sendVideoSegment(
 class VideoTracker {
     private video: HTMLVideoElement;
     private segmentStartTime: number | null = null;
-    private captureCount = 0;   // periodic captures so far this session
+    private captureCount = 0;
     private intervalTimer: ReturnType<typeof setTimeout> | null = null;
 
     private onPlayBound: () => void;
@@ -317,9 +303,6 @@ class VideoTracker {
         this.video.addEventListener('ended', this.onEndedBound);
         console.log('[MindStack YT] Video tracker attached.');
 
-        // FIX: If the video is already playing when we attach (e.g. autoplay or
-        // the extension loaded mid-playback), the 'play' event will never fire.
-        // Simulate it so segmentStartTime and the periodic timer are initialised.
         if (!this.video.paused && !this.video.ended) {
             console.log('[MindStack YT] Video already playing on attach — simulating play event.');
             this.onPlay();
@@ -334,8 +317,6 @@ class VideoTracker {
         console.log('[MindStack YT] Video tracker destroyed.');
     }
 
-    // ---- event handlers -----------------------------------------------
-
     private onPlay(): void {
         this.segmentStartTime = this.video.currentTime;
         this.scheduleNextCapture();
@@ -345,7 +326,6 @@ class VideoTracker {
     private onPause(): void {
         this.stopPeriodicCapture();
         if (this.segmentStartTime !== null) {
-            // ✅ Capture frame + captions synchronously right now, before any async work
             const frame = captureKeyframe(this.video);
             const captions = extractCaptions();
             const endTime = this.video.currentTime;
@@ -360,14 +340,6 @@ class VideoTracker {
         this.onPause();
     }
 
-    // ---- periodic capture (setTimeout loop) ---------------------------
-
-    /**
-     * Schedules the next periodic capture.
-     * Using setTimeout (not setInterval) so the delay recalculates from the
-     * current video.duration on every tick — handles cases where YouTube
-     * delivers duration late.
-     */
     private scheduleNextCapture(): void {
         if (this.captureCount >= MAX_PERIODIC_CAPTURES) {
             console.log('[MindStack YT] Periodic cap reached — no more auto-captures.');
@@ -376,11 +348,6 @@ class VideoTracker {
 
         const duration = this.video.duration;
 
-        // FIX: If duration isn't available yet (NaN — common on initial play before
-        // the metadata loads), retry after a short delay rather than defaulting to
-        // 30 s. This is why interval captures never fired if the video played straight
-        // through without a pause: the first schedule used NaN → 30s, and a 10-minute
-        // video only got a capture at t=30s which fired before segmentStartTime was set.
         if (!isFinite(duration) || duration <= 0) {
             console.log('[MindStack YT] Duration not yet available — retrying schedule in 1.5s.');
             this.intervalTimer = setTimeout(() => {
@@ -406,22 +373,19 @@ class VideoTracker {
         this.intervalTimer = setTimeout(() => {
             this.intervalTimer = null;
 
-            // Skip if video is paused/ended (onPause already handled it)
             if (this.video.paused || this.video.ended) return;
             if (this.segmentStartTime === null) return;
 
-            // ✅ Capture frame + captions synchronously before any async work
             const frame = captureKeyframe(this.video);
             const captions = extractCaptions();
             const endTime = this.video.currentTime;
             const startTime = this.segmentStartTime;
-            this.segmentStartTime = endTime; // slide the window forward
+            this.segmentStartTime = endTime;
             this.captureCount++;
 
             console.log(`[MindStack YT] Periodic capture #${this.captureCount}/${MAX_PERIODIC_CAPTURES} at ${endTime.toFixed(1)}s`);
             sendVideoSegment(this.video, startTime, endTime, frame, captions);
 
-            // Schedule the next one
             this.scheduleNextCapture();
         }, intervalMs);
     }
@@ -445,7 +409,6 @@ function findAndTrackVideo(): void {
     if (video) {
         initTracker(video);
     } else {
-        // MutationObserver fallback: wait for <video> to appear
         const mo = new MutationObserver((_, obs) => {
             const v = document.querySelector<HTMLVideoElement>('video');
             if (v) {

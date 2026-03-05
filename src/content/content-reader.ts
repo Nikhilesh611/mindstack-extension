@@ -5,11 +5,13 @@
  * Runs at document_idle. Sends WEB_TEXT captures to the background worker.
  *
  * Key behaviours:
- *   - Caches URL/title at observation time (Fix â‘ : SPA URL race condition)
+ *   - Caches URL/title at observation time (Fix ①: SPA URL race condition)
  *   - 3-second dwell before capturing
  *   - Deduplicates by text hash
- *   - Injects stealth toast on success (Fix â‘£)
+ *   - Injects stealth toast on success (Fix ④)
  *   - Skips nav / header / footer / aside elements
+ *   - Workspace-aware: session is only active when BOTH session_id AND
+ *     (project_id OR workspace_id) are present in storage.
  */
 
 const DWELL_TIME_MS = 3000;
@@ -20,8 +22,7 @@ const MIN_TEXT_LENGTH = 80;
 
 /**
  * Returns false when the extension has been reloaded/updated and this
- * content-script's context is no longer valid. Any chrome.* call made
- * after invalidation throws "Extension context invalidated."
+ * content-script's context is no longer valid.
  */
 function isContextValid(): boolean {
     try {
@@ -87,22 +88,33 @@ function injectToast(message: string): void {
     }, 2500);
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // Core Logic
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 const sentHashes = new Set<string>();
 const pendingTimers = new Map<Element, ReturnType<typeof setTimeout>>();
 
 let isSessionActive = false;
 
+/**
+ * CRITICAL FIX: Session is only considered active when BOTH a session_id
+ * AND at least one context ID (project_id OR workspace_id) are present.
+ */
 async function checkSessionActive(): Promise<boolean> {
     if (!isContextValid()) return false;
     return new Promise((resolve) => {
         try {
-            chrome.storage.local.get(['mindstack_session_id'], (result) => {
-                resolve(!!result['mindstack_session_id']);
-            });
+            chrome.storage.local.get(
+                ['mindstack_session_id', 'mindstack_project_id', 'mindstack_workspace_id'],
+                (result) => {
+                    const isActive = !!(
+                        result['mindstack_session_id'] &&
+                        (result['mindstack_project_id'] || result['mindstack_workspace_id'])
+                    );
+                    resolve(isActive);
+                }
+            );
         } catch {
             resolve(false);
         }
@@ -111,20 +123,22 @@ async function checkSessionActive(): Promise<boolean> {
 
 async function sendCapture(
     text: string,
-    cachedUrl: string,  // Fix â‘ : cached at observation time
-    cachedTitle: string // Fix â‘ : cached at observation time
+    cachedUrl: string,  // Fix ①: cached at observation time
+    cachedTitle: string // Fix ①: cached at observation time
 ): Promise<void> {
     const hash = hashText(text.trim());
     if (sentHashes.has(hash)) return;
     sentHashes.add(hash);
 
-    // Guard: context may have been invalidated if the extension was reloaded
     if (!isContextValid()) return;
 
-    // Re-read session/project from storage at send time (MV3 safety)
+    // Re-read session/project/workspace from storage at send time (MV3 safety)
     const stored: Record<string, string> = await new Promise((resolve) => {
         try {
-            chrome.storage.local.get(['mindstack_session_id', 'mindstack_project_id'], resolve as () => void);
+            chrome.storage.local.get(
+                ['mindstack_session_id', 'mindstack_project_id', 'mindstack_workspace_id'],
+                resolve as () => void
+            );
         } catch {
             resolve({});
         }
@@ -133,8 +147,11 @@ async function sendCapture(
     if (!isContextValid()) return; // re-check after the async gap
 
     const sessionId = stored['mindstack_session_id'];
-    const projectId = stored['mindstack_project_id'];
-    if (!sessionId || !projectId) return;
+    const projectId = stored['mindstack_project_id'] || null;
+    const workspaceId = stored['mindstack_workspace_id'] || null;
+
+    // Must have a session AND at least one context ID
+    if (!sessionId || (!projectId && !workspaceId)) return;
 
     try {
         chrome.runtime.sendMessage(
@@ -143,6 +160,7 @@ async function sendCapture(
                 payload: {
                     session_id: sessionId,
                     project_id: projectId,
+                    workspace_id: workspaceId,
                     capture_type: 'WEB_TEXT',
                     text_content: text.trim().slice(0, 4000),
                     source_url: cachedUrl,
@@ -151,14 +169,9 @@ async function sendCapture(
                 },
             },
             (response) => {
-                // Must read lastError to suppress Chrome's "unchecked runtime.lastError"
-                // which appears as a misleading 403 in DevTools when the background
-                // service worker is asleep (normal MV3 behaviour) or the context
-                // was invalidated after an extension reload.
                 if (chrome.runtime.lastError) return;
 
                 if (response?.success) {
-                    // Fix ④: Stealth toast notification
                     const shortTitle = cachedTitle.slice(0, 40) + (cachedTitle.length > 40 ? '\u2026' : '');
                     injectToast('Captured — ' + shortTitle);
                 }
@@ -178,7 +191,7 @@ function setupObserver(): void {
                 const el = entry.target as HTMLElement;
 
                 if (entry.isIntersecting) {
-                    // Fix â‘ : Cache URL and title at the moment of observation
+                    // Fix ①: Cache URL and title at the moment of observation
                     const cachedUrl = window.location.href;
                     const cachedTitle = document.title;
 
@@ -194,7 +207,7 @@ function setupObserver(): void {
 
                     pendingTimers.set(el, timer);
                 } else {
-                    // Element left viewport before timer fired â€” cancel
+                    // Element left viewport before timer fired — cancel
                     const timer = pendingTimers.get(el);
                     if (timer !== undefined) {
                         clearTimeout(timer);
@@ -236,9 +249,9 @@ function setupObserver(): void {
     mutationObserver.observe(document.body, { childList: true, subtree: true });
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 // Init
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
     isSessionActive = await checkSessionActive();
@@ -248,7 +261,6 @@ async function main(): Promise<void> {
     }
 
     // Poll for session state changes (e.g., user started a new session while on the page).
-    // Self-cancels when the extension context is invalidated (reload/update).
     const pollInterval = setInterval(async () => {
         if (!isContextValid()) {
             clearInterval(pollInterval);
@@ -269,4 +281,3 @@ async function main(): Promise<void> {
 }
 
 main();
-

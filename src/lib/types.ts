@@ -9,6 +9,15 @@ export interface Project {
     created_at: string;
 }
 
+export interface Workspace {
+    id: string;
+    name: string;
+    role: string;
+    display_name: string;
+    join_code?: string;
+    created_at: string;
+}
+
 export interface CaptureAttachment {
     id: string;
     s3_url: string;
@@ -19,7 +28,8 @@ export interface CaptureAttachment {
 export interface Capture {
     id: string;
     session_id: string;
-    project_id: string;
+    project_id: string | null;
+    workspace_id?: string | null;
     capture_type: CaptureType;
     priority: number;
     source_url: string | null;
@@ -28,6 +38,7 @@ export interface Capture {
     video_end_time: number | null;
     text_content: string | null;
     ai_markdown_summary: string | null;
+    author_display_name?: string | null;
     created_at: string;
     capture_attachments: CaptureAttachment[];
 }
@@ -57,6 +68,7 @@ export interface CaptureAttachmentInput {
 
 export type MessageType =
     | 'GET_PROJECTS'
+    | 'GET_WORKSPACES'
     | 'CREATE_PROJECT'
     | 'START_SESSION'
     | 'END_SESSION'
@@ -76,6 +88,10 @@ export interface GetProjectsMessage extends BaseMessage {
     type: 'GET_PROJECTS';
 }
 
+export interface GetWorkspacesMessage extends BaseMessage {
+    type: 'GET_WORKSPACES';
+}
+
 export interface CreateProjectMessage extends BaseMessage {
     type: 'CREATE_PROJECT';
     name: string;
@@ -84,7 +100,8 @@ export interface CreateProjectMessage extends BaseMessage {
 
 export interface StartSessionMessage extends BaseMessage {
     type: 'START_SESSION';
-    project_id: string;
+    project_id?: string | null;
+    workspace_id?: string | null;
 }
 
 export interface EndSessionMessage extends BaseMessage {
@@ -95,7 +112,8 @@ export interface IngestBrowserMessage extends BaseMessage {
     type: 'INGEST_BROWSER';
     payload: {
         session_id: string;
-        project_id: string;
+        project_id?: string | null;
+        workspace_id?: string | null;
         capture_type: CaptureType;
         text_content?: string;
         source_url?: string;
@@ -111,7 +129,8 @@ export interface IngestVideoMessage extends BaseMessage {
     type: 'INGEST_VIDEO';
     payload: {
         session_id: string;
-        project_id: string;
+        project_id?: string | null;
+        workspace_id?: string | null;
         source_url: string;
         page_title: string;
         video_start_time: number;
@@ -129,7 +148,8 @@ export interface GetPresignedUrlMessage extends BaseMessage {
 
 export interface GetCapturesMessage extends BaseMessage {
     type: 'GET_CAPTURES';
-    project_id: string;
+    project_id?: string | null;
+    workspace_id?: string | null;
 }
 
 export interface DeleteCaptureMessage extends BaseMessage {
@@ -141,6 +161,8 @@ export interface ProcessDocumentMessage extends BaseMessage {
     type: 'PROCESS_DOCUMENT';
     capture_id: string;
     s3_url: string;
+    project_id?: string | null;
+    workspace_id?: string | null;
 }
 
 export interface GetYTCaptionUrlMessage extends BaseMessage {
@@ -149,6 +171,7 @@ export interface GetYTCaptionUrlMessage extends BaseMessage {
 
 export type ExtensionMessage =
     | GetProjectsMessage
+    | GetWorkspacesMessage
     | CreateProjectMessage
     | StartSessionMessage
     | EndSessionMessage
