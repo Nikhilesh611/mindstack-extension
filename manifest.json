@@ -26,6 +26,7 @@
             "128": "icons/icon128.png"
         }
     },
+    "options_page": "src/upload/upload.html",
     "content_scripts": [
         {
             "matches": [
