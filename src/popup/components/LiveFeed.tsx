@@ -4,6 +4,7 @@ import type { Capture, MessageResponse } from '../../lib/types';
 interface LiveFeedProps {
     projectId: string | null;
     workspaceId: string | null;
+    workspaceName?: string | null;
     activeSessionId: string | null;
 }
 
@@ -43,7 +44,7 @@ function timeAgo(isoString: string): string {
     return `${Math.floor(delta / 86400)}d ago`;
 }
 
-export default function LiveFeed({ projectId, workspaceId, activeSessionId }: LiveFeedProps) {
+export default function LiveFeed({ projectId, workspaceId, workspaceName, activeSessionId }: LiveFeedProps) {
     const [captures, setCaptures] = useState<Capture[]>([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -160,12 +161,12 @@ export default function LiveFeed({ projectId, workspaceId, activeSessionId }: Li
                                     <span className="font-mono text-[10px] text-ghost-muted">
                                         {timeAgo(capture.created_at)}
                                     </span>
-                                    {/* Teammate attribution badge (workspace captures) */}
-                                    {capture.author_display_name && (
+                                    {/* Workspace team name badge */}
+                                    {workspaceName && (
                                         <>
                                             <span className="font-mono text-[10px] text-ghost-muted">·</span>
                                             <span className="font-mono text-[10px] px-1.5 py-0.5 rounded-full bg-ghost-accent/10 border border-ghost-accent/25 text-ghost-accent">
-                                                👤 {capture.author_display_name}
+                                                🏢 {workspaceName}
                                             </span>
                                         </>
                                     )}

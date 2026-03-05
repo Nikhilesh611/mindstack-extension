@@ -7,7 +7,9 @@
         "storage",
         "activeTab",
         "scripting",
-        "notifications"
+        "notifications",
+        "tabs",
+        "windows"
     ],
     "host_permissions": [
         "<all_urls>",
@@ -49,5 +51,16 @@
     ],
     "icons": {
         "128": "icons/icon128.png"
-    }
+    },
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "src/upload/upload.html",
+                "src/upload/upload.ts"
+            ],
+            "matches": [
+                "<all_urls>"
+            ]
+        }
+    ]
 }

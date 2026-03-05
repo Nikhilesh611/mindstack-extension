@@ -115,7 +115,7 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
                 return match ? { ...prev, name: match.name } : prev;
             } else {
                 const match = fetchedWorkspaces.find((w) => w.id === prev.id);
-                return match ? { ...prev, name: match.display_name || match.name } : prev;
+                return match ? { ...prev, name: match.name } : prev;
             }
         });
 
@@ -159,7 +159,7 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
     const handleContextChange = (id: string, type: ContextType) => {
         const project = type === 'project' ? projects.find((p) => p.id === id) : null;
         const workspace = type === 'workspace' ? workspaces.find((w) => w.id === id) : null;
-        const name = project?.name ?? workspace?.display_name ?? workspace?.name ?? '';
+        const name = project?.name ?? workspace?.name ?? '';
 
         setSelectedContext({ id, type, name });
 
@@ -319,7 +319,7 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
                             <optgroup label="Team Workspaces">
                                 {workspaces.map((w) => (
                                     <option key={w.id} value={`workspace:${w.id}`} className="bg-ghost-surface">
-                                        {w.display_name || w.name}
+                                        {w.name}
                                         {w.role ? ` (${w.role})` : ''}
                                     </option>
                                 ))}
@@ -390,6 +390,7 @@ export default function CommandCenter({ onLogout }: CommandCenterProps) {
                             <LiveFeed
                                 projectId={selectedContext.type === 'project' ? selectedContext.id : null}
                                 workspaceId={selectedContext.type === 'workspace' ? selectedContext.id : null}
+                                workspaceName={selectedContext.type === 'workspace' ? selectedContext.name : null}
                                 activeSessionId={activeSessionId}
                             />
                         ) : (

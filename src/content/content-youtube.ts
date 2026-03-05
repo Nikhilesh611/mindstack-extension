@@ -3,24 +3,18 @@
  * content-youtube.ts
  * Video segment tracker for YouTube (youtube.com only).
  *
- * Key behaviours:
- *   - Re-initializes on `yt-navigate-finish` (YouTube SPA navigation)
- *   - MutationObserver fallback to detect <video> element
- *   - Tracks video play/pause to record (startTime, endTime) segments
- *   - Frame snapshot captured SYNCHRONOUSLY at the moment of capture (before
- *     any async work) so the canvas always contains the correct frame
- *   - Periodic auto-capture: up to MAX_PERIODIC_CAPTURES per session, interval
- *     spread evenly across the video duration (min MIN_CAPTURE_INTERVAL_MS)
- *   - On pause: immediate frame snapshot + segment send
- *   - Sends INGEST_VIDEO message to background (background handles S3 + ingest)
- *   - Injects stealth toast on success
- *   - Workspace-aware: session is only active when BOTH session_id AND
- *     (project_id OR workspace_id) are present in storage.
+ * FIXED BUGS:
+ *   1. Hard reload required — added chrome.storage.onChanged listener so the
+ *      tracker initialises as soon as a session starts, without needing a reload.
+ *   2. No interaction captures — replaced duration-spread intervals with a
+ *      fixed PERIODIC_INTERVAL_MS (30 s) that fires unconditionally while playing.
+ *   3. Transcript only at instant — fetchTranscriptForSegment now fetches the
+ *      full caption text from startTime → endTime of the segment, not a midpoint window.
  */
 
 const MIN_SEGMENT_DURATION_SEC = 3;
-const MAX_PERIODIC_CAPTURES = 10;
-const MIN_CAPTURE_INTERVAL_MS = 30_000;
+const PERIODIC_INTERVAL_MS = 30_000;   // capture every 30s regardless of video length
+const MAX_PERIODIC_CAPTURES = 20;        // safety cap per video
 const DURATION_RETRY_DELAY_MS = 1_500;
 
 // ---------------------------------------------------------------------------
@@ -30,37 +24,21 @@ const DURATION_RETRY_DELAY_MS = 1_500;
 function injectToast(message: string): void {
     const toast = document.createElement('div');
     toast.style.cssText = `
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    z-index: 2147483647;
-    background: #0F172A;
-    color: #38BDF8;
+    position: fixed; bottom: 20px; right: 20px; z-index: 2147483647;
+    background: #0F172A; color: #38BDF8;
     font-family: 'JetBrains Mono', 'Fira Code', monospace;
-    font-size: 12px;
-    padding: 8px 14px;
-    border-radius: 6px;
-    border: 1px solid #334155;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.5);
-    pointer-events: none;
-    opacity: 0;
-    transform: translateY(8px);
+    font-size: 12px; padding: 8px 14px; border-radius: 6px;
+    border: 1px solid #334155; box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+    pointer-events: none; opacity: 0; transform: translateY(8px);
     transition: opacity 0.2s ease, transform 0.2s ease;
-    max-width: 300px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    max-width: 300px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   `;
     toast.textContent = `👻 MindStack: ${message}`;
     document.body.appendChild(toast);
-
-    requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-            toast.style.opacity = '1';
-            toast.style.transform = 'translateY(0)';
-        });
-    });
-
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+        toast.style.opacity = '1';
+        toast.style.transform = 'translateY(0)';
+    }));
     setTimeout(() => {
         toast.style.opacity = '0';
         toast.style.transform = 'translateY(8px)';
@@ -69,7 +47,7 @@ function injectToast(message: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Frame capture  — MUST be called synchronously (before any await)
+// Frame capture — MUST be called synchronously (before any await)
 // ---------------------------------------------------------------------------
 
 function captureKeyframe(video: HTMLVideoElement): string | null {
@@ -88,7 +66,7 @@ function captureKeyframe(video: HTMLVideoElement): string | null {
 }
 
 /**
- * Extracts the current caption/subtitle text visible on screen.
+ * Extracts the current caption/subtitle text visible in the DOM right now.
  */
 function extractCaptions(): string {
     const segments = document.querySelectorAll('.ytp-caption-segment');
@@ -100,14 +78,16 @@ function extractCaptions(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Transcript extraction via page-world script injection
+// Transcript extraction — full range from startSec to endSec
+// BUG 3 FIX: Instead of a symmetric window around the midpoint, we now fetch
+// everything from startSec to endSec so the capture includes all spoken words
+// during that segment, not just what was visible at the moment of snapshot.
 // ---------------------------------------------------------------------------
 
 function getYouTubeCaptionTrackUrl(): Promise<string | null> {
     return new Promise((resolve) => {
         chrome.runtime.sendMessage({ type: 'GET_YT_CAPTION_URL' }, (response) => {
             if (chrome.runtime.lastError) {
-                console.warn('[MindStack YT] getYouTubeCaptionTrackUrl error:', chrome.runtime.lastError.message);
                 resolve(null);
             } else {
                 resolve(response?.data?.url ?? null);
@@ -116,16 +96,13 @@ function getYouTubeCaptionTrackUrl(): Promise<string | null> {
     });
 }
 
-async function fetchTranscriptWindow(
-    captureTimeSec: number,
-    windowSec = 60,
+async function fetchTranscriptForSegment(
+    startSec: number,
+    endSec: number,
 ): Promise<string> {
     try {
         const trackUrl = await getYouTubeCaptionTrackUrl();
-        if (!trackUrl) {
-            console.log('[MindStack YT] No caption track URL — falling back to DOM captions.');
-            return '';
-        }
+        if (!trackUrl) return '';
 
         const res = await fetch(`${trackUrl}&fmt=json3`);
         if (!res.ok) return '';
@@ -140,17 +117,16 @@ async function fetchTranscriptWindow(
 
         if (!Array.isArray(data.events) || data.events.length === 0) return '';
 
-        const halfWindowMs = (windowSec / 2) * 1000;
-        const captureMs = captureTimeSec * 1000;
-        const rangeStartMs = captureMs - halfWindowMs;
-        const rangeEndMs = captureMs + halfWindowMs;
+        const startMs = startSec * 1000;
+        const endMs = endSec * 1000;
 
         const text = data.events
             .filter((e) => {
                 if (e.tStartMs === undefined) return false;
-                const captionStartMs = e.tStartMs;
-                const captionEndMs = captionStartMs + (e.dDurationMs ?? 0);
-                return captionStartMs <= rangeEndMs && captionEndMs >= rangeStartMs;
+                const captionStart = e.tStartMs;
+                const captionEnd = captionStart + (e.dDurationMs ?? 0);
+                // Include any caption event that overlaps [startMs, endMs]
+                return captionStart < endMs && captionEnd > startMs;
             })
             .flatMap((e) => e.segs ?? [])
             .map((s) => s.utf8 ?? '')
@@ -158,7 +134,9 @@ async function fetchTranscriptWindow(
             .replace(/\n/g, ' ')
             .trim();
 
-        console.log(`[MindStack YT] Transcript window: ${text.length} chars (±${windowSec / 2}s around ${captureTimeSec.toFixed(1)}s)`);
+        console.log(
+            `[MindStack YT] Transcript ${startSec.toFixed(1)}s→${endSec.toFixed(1)}s: ${text.length} chars`
+        );
         return text;
     } catch (e) {
         console.warn('[MindStack YT] Transcript fetch failed:', e);
@@ -176,10 +154,6 @@ interface ActiveSession {
     workspaceId: string | null;
 }
 
-/**
- * CRITICAL FIX: Session is only considered active when BOTH session_id AND
- * at least one context ID (project_id OR workspace_id) are present in storage.
- */
 async function getActiveSession(): Promise<ActiveSession | null> {
     return new Promise((resolve) => {
         chrome.storage.local.get(
@@ -188,8 +162,6 @@ async function getActiveSession(): Promise<ActiveSession | null> {
                 const sessionId = result['mindstack_session_id'] as string | undefined;
                 const projectId = (result['mindstack_project_id'] as string | undefined) ?? null;
                 const workspaceId = (result['mindstack_workspace_id'] as string | undefined) ?? null;
-
-                // Must have session AND at least one of project or workspace
                 const isActive = !!(sessionId && (projectId || workspaceId));
                 resolve(isActive ? { sessionId: sessionId!, projectId, workspaceId } : null);
             }
@@ -199,18 +171,15 @@ async function getActiveSession(): Promise<ActiveSession | null> {
 
 // ---------------------------------------------------------------------------
 // Segment sender
-// frame is captured by the CALLER synchronously, then passed in here so the
-// async session lookup doesn't cause us to draw from the wrong video position.
 // ---------------------------------------------------------------------------
 
 async function sendVideoSegment(
     video: HTMLVideoElement,
     startTime: number,
-    _endTime: number,
+    endTime: number,
     preCapturedFrame?: string | null,
-    _preCapturedCaptions?: string,
 ): Promise<void> {
-    const watchedDuration = _endTime - startTime;
+    const watchedDuration = endTime - startTime;
     if (watchedDuration < MIN_SEGMENT_DURATION_SEC) {
         console.log(`[MindStack YT] Segment too short (${watchedDuration.toFixed(1)}s) — skipped.`);
         return;
@@ -224,19 +193,15 @@ async function sendVideoSegment(
 
     const base64Frame = preCapturedFrame ?? captureKeyframe(video) ?? '';
 
-    // ── Transcript extraction (3-level fallback) ──────────────────────────────
-    const segmentDuration = _endTime - startTime;
-    const segmentCenter = startTime + (segmentDuration / 2);
-    let text_content = await fetchTranscriptWindow(segmentCenter, segmentDuration);
+    // BUG 3 FIX: Fetch transcript from startTime → endTime (full segment range)
+    let text_content = await fetchTranscriptForSegment(startTime, endTime);
     if (!text_content) {
+        // Fallback: DOM captions visible right now
         text_content = extractCaptions();
         if (text_content) {
-            console.log(`[MindStack YT] Using DOM captions as fallback: "${text_content.slice(0, 60)}…"`);
+            console.log(`[MindStack YT] DOM caption fallback: "${text_content.slice(0, 60)}…"`);
         }
     }
-
-    const captureStartTime = startTime;
-    const captureEndTime = _endTime;
 
     const payload = {
         type: 'INGEST_VIDEO' as const,
@@ -246,18 +211,17 @@ async function sendVideoSegment(
             workspace_id: session.workspaceId,
             source_url: window.location.href,
             page_title: document.title,
-            video_start_time: captureStartTime,
-            video_end_time: captureEndTime,
+            video_start_time: startTime,
+            video_end_time: endTime,
             base64Frame,
             caption_text: text_content,
         },
     };
 
     console.log(
-        `[MindStack YT] Sending capture — watched ${watchedDuration.toFixed(1)}s, ` +
-        `keyframe window: ${captureStartTime.toFixed(1)}s → ${captureEndTime.toFixed(1)}s, ` +
-        `transcript: ${text_content.length} chars, ` +
-        `context: ${session.projectId ? `project:${session.projectId}` : `workspace:${session.workspaceId}`}`,
+        `[MindStack YT] Sending capture — ${startTime.toFixed(1)}s → ${endTime.toFixed(1)}s ` +
+        `(${watchedDuration.toFixed(1)}s), transcript: ${text_content.length} chars, ` +
+        `context: ${session.projectId ? `project:${session.projectId}` : `workspace:${session.workspaceId}`}`
     );
 
     chrome.runtime.sendMessage(payload, (response) => {
@@ -266,24 +230,28 @@ async function sendVideoSegment(
             return;
         }
         if (response?.success) {
-            const title = document.title.replace(' - YouTube', '').slice(0, 35);
-            injectToast(`Captured — ${title}`);
+            injectToast(`Captured — ${document.title.replace(' - YouTube', '').slice(0, 35)}`);
         } else {
-            console.warn('[MindStack YT] Video ingest failed:', response?.error);
-            injectToast(`Capture failed — ${response?.error ?? 'unknown error'}`);
+            console.warn('[MindStack YT] Ingest failed:', response?.error);
+            injectToast(`Capture failed — ${response?.error ?? 'unknown'}`);
         }
     });
 }
 
 // ---------------------------------------------------------------------------
-// Video Tracker
+// VideoTracker
+// BUG 1 FIX: Periodic captures use a fixed 30s interval (PERIODIC_INTERVAL_MS)
+//            instead of duration/MAX_CAPTURES — fires unconditionally while playing.
+// BUG 2 FIX: Segments are non-overlapping — segmentStartTime resets to endTime
+//            after each periodic capture.
 // ---------------------------------------------------------------------------
 
 class VideoTracker {
     private video: HTMLVideoElement;
     private segmentStartTime: number | null = null;
     private captureCount = 0;
-    private intervalTimer: ReturnType<typeof setTimeout> | null = null;
+    private intervalHandle: ReturnType<typeof setInterval> | null = null;
+    private durationRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
     private onPlayBound: () => void;
     private onPauseBound: () => void;
@@ -301,10 +269,11 @@ class VideoTracker {
         this.video.addEventListener('play', this.onPlayBound);
         this.video.addEventListener('pause', this.onPauseBound);
         this.video.addEventListener('ended', this.onEndedBound);
-        console.log('[MindStack YT] Video tracker attached.');
+        console.log('[MindStack YT] Tracker attached.');
 
+        // If video is already playing when we attach, start tracking immediately
         if (!this.video.paused && !this.video.ended) {
-            console.log('[MindStack YT] Video already playing on attach — simulating play event.');
+            console.log('[MindStack YT] Already playing — starting tracker.');
             this.onPlay();
         }
     }
@@ -314,25 +283,24 @@ class VideoTracker {
         this.video.removeEventListener('pause', this.onPauseBound);
         this.video.removeEventListener('ended', this.onEndedBound);
         this.stopPeriodicCapture();
-        console.log('[MindStack YT] Video tracker destroyed.');
+        console.log('[MindStack YT] Tracker destroyed.');
     }
 
     private onPlay(): void {
         this.segmentStartTime = this.video.currentTime;
-        this.scheduleNextCapture();
-        console.log(`[MindStack YT] Play — segment started at ${this.segmentStartTime.toFixed(1)}s`);
+        this.startPeriodicCapture();
+        console.log(`[MindStack YT] Play — segment start at ${this.segmentStartTime.toFixed(1)}s`);
     }
 
     private onPause(): void {
         this.stopPeriodicCapture();
         if (this.segmentStartTime !== null) {
-            const frame = captureKeyframe(this.video);
-            const captions = extractCaptions();
+            const frame = captureKeyframe(this.video); // sync, before any await
             const endTime = this.video.currentTime;
             const startTime = this.segmentStartTime;
             this.segmentStartTime = null;
-            console.log(`[MindStack YT] Pause — sending segment ${startTime.toFixed(1)}s → ${endTime.toFixed(1)}s`);
-            sendVideoSegment(this.video, startTime, endTime, frame, captions);
+            console.log(`[MindStack YT] Pause — segment ${startTime.toFixed(1)}s → ${endTime.toFixed(1)}s`);
+            sendVideoSegment(this.video, startTime, endTime, frame);
         }
     }
 
@@ -340,69 +308,81 @@ class VideoTracker {
         this.onPause();
     }
 
-    private scheduleNextCapture(): void {
-        if (this.captureCount >= MAX_PERIODIC_CAPTURES) {
-            console.log('[MindStack YT] Periodic cap reached — no more auto-captures.');
-            return;
-        }
+    // BUG 1 FIX: Use setInterval with a fixed 30s period.
+    // setInterval fires repeatedly without needing user interaction (pause/play).
+    // Each fire sends the current non-overlapping segment and resets the start.
+    private startPeriodicCapture(): void {
+        this.stopPeriodicCapture(); // avoid double-start
 
-        const duration = this.video.duration;
+        const tryStart = () => {
+            const duration = this.video.duration;
+            if (!isFinite(duration) || duration <= 0) {
+                console.log('[MindStack YT] Duration not ready — retrying in 1.5s');
+                this.durationRetryTimer = setTimeout(tryStart, DURATION_RETRY_DELAY_MS);
+                return;
+            }
 
-        if (!isFinite(duration) || duration <= 0) {
-            console.log('[MindStack YT] Duration not yet available — retrying schedule in 1.5s.');
-            this.intervalTimer = setTimeout(() => {
-                this.intervalTimer = null;
-                if (!this.video.paused && !this.video.ended) {
-                    this.scheduleNextCapture();
+            console.log(`[MindStack YT] Starting periodic capture every ${PERIODIC_INTERVAL_MS / 1000}s`);
+
+            this.intervalHandle = setInterval(() => {
+                if (this.video.paused || this.video.ended) {
+                    // Video paused mid-interval — the pause handler will send the segment
+                    this.stopPeriodicCapture();
+                    return;
                 }
-            }, DURATION_RETRY_DELAY_MS);
-            return;
-        }
+                if (this.segmentStartTime === null) return;
+                if (this.captureCount >= MAX_PERIODIC_CAPTURES) {
+                    console.log('[MindStack YT] Max periodic captures reached.');
+                    this.stopPeriodicCapture();
+                    return;
+                }
 
-        const intervalMs = Math.max(
-            (duration / MAX_PERIODIC_CAPTURES) * 1000,
-            MIN_CAPTURE_INTERVAL_MS,
-        );
+                const frame = captureKeyframe(this.video); // sync capture
+                const endTime = this.video.currentTime;
+                const startTime = this.segmentStartTime;
 
-        console.log(
-            `[MindStack YT] Next periodic capture in ${(intervalMs / 1000).toFixed(0)}s ` +
-            `(capture ${this.captureCount + 1}/${MAX_PERIODIC_CAPTURES}, ` +
-            `video duration: ${duration.toFixed(0)}s)`,
-        );
+                // BUG 2 FIX: reset start to endTime so next segment is non-overlapping
+                this.segmentStartTime = endTime;
+                this.captureCount++;
 
-        this.intervalTimer = setTimeout(() => {
-            this.intervalTimer = null;
+                console.log(
+                    `[MindStack YT] Periodic capture #${this.captureCount}/${MAX_PERIODIC_CAPTURES} ` +
+                    `at ${endTime.toFixed(1)}s`
+                );
+                sendVideoSegment(this.video, startTime, endTime, frame);
+            }, PERIODIC_INTERVAL_MS);
+        };
 
-            if (this.video.paused || this.video.ended) return;
-            if (this.segmentStartTime === null) return;
-
-            const frame = captureKeyframe(this.video);
-            const captions = extractCaptions();
-            const endTime = this.video.currentTime;
-            const startTime = this.segmentStartTime;
-            this.segmentStartTime = endTime;
-            this.captureCount++;
-
-            console.log(`[MindStack YT] Periodic capture #${this.captureCount}/${MAX_PERIODIC_CAPTURES} at ${endTime.toFixed(1)}s`);
-            sendVideoSegment(this.video, startTime, endTime, frame, captions);
-
-            this.scheduleNextCapture();
-        }, intervalMs);
+        tryStart();
     }
 
     private stopPeriodicCapture(): void {
-        if (this.intervalTimer !== null) {
-            clearTimeout(this.intervalTimer);
-            this.intervalTimer = null;
+        if (this.intervalHandle !== null) {
+            clearInterval(this.intervalHandle);
+            this.intervalHandle = null;
+        }
+        if (this.durationRetryTimer !== null) {
+            clearTimeout(this.durationRetryTimer);
+            this.durationRetryTimer = null;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Page Lifecycle Manager
+// BUG 1 FIX: Added chrome.storage.onChanged listener — when a session/context
+//            key is written to storage, we re-check and init the tracker if
+//            needed. No hard reload required to start capturing.
 // ---------------------------------------------------------------------------
 
 let currentTracker: VideoTracker | null = null;
+
+function initTracker(video: HTMLVideoElement): void {
+    if (currentTracker) {
+        currentTracker.destroy();
+    }
+    currentTracker = new VideoTracker(video);
+}
 
 function findAndTrackVideo(): void {
     const video = document.querySelector<HTMLVideoElement>('video');
@@ -420,16 +400,34 @@ function findAndTrackVideo(): void {
     }
 }
 
-function initTracker(video: HTMLVideoElement): void {
-    if (currentTracker) {
-        currentTracker.destroy();
+// BUG 1 FIX: Watch for session becoming active without a page reload.
+// When the user starts a session in the popup, mindstack_session_id or
+// mindstack_project_id/workspace_id are written to storage. We detect that
+// here and re-init the tracker so captures start immediately.
+chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    const sessionKeys = ['mindstack_session_id', 'mindstack_project_id', 'mindstack_workspace_id'];
+    const relevant = sessionKeys.some((k) => k in changes);
+    if (!relevant) return;
+
+    const anyNewValue = sessionKeys.some((k) => changes[k]?.newValue);
+    if (anyNewValue) {
+        console.log('[MindStack YT] Session/context changed — re-initialising tracker.');
+        // Small delay to let all storage writes settle
+        setTimeout(findAndTrackVideo, 500);
+    } else {
+        // Session ended — destroy tracker
+        if (currentTracker) {
+            console.log('[MindStack YT] Session ended — destroying tracker.');
+            currentTracker.destroy();
+            currentTracker = null;
+        }
     }
-    currentTracker = new VideoTracker(video);
-}
+});
 
 // YouTube SPA navigation — re-initialize on each video navigation
 window.addEventListener('yt-navigate-finish', () => {
-    console.log('[MindStack YT] yt-navigate-finish fired — re-initializing tracker.');
+    console.log('[MindStack YT] yt-navigate-finish — re-initialising tracker.');
     setTimeout(findAndTrackVideo, 800);
 });
 

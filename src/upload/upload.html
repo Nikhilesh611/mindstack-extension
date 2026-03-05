@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>MindStack — Upload File</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'JetBrains Mono', monospace;
+      background: #0a0e1a;
+      color: #e2e8f0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 24px;
+      gap: 16px;
+    }
+
+    h2 {
+      font-size: 14px;
+      color: #94a3b8;
+      letter-spacing: 0.05em;
+    }
+
+    #drop-zone {
+      width: 100%;
+      max-width: 360px;
+      border: 2px dashed #334155;
+      border-radius: 10px;
+      padding: 32px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    #drop-zone:hover,
+    #drop-zone.drag-over {
+      border-color: #818cf8;
+      background: rgba(129, 140, 248, 0.05);
+    }
+
+    #drop-zone .icon {
+      font-size: 32px;
+      margin-bottom: 10px;
+    }
+
+    #drop-zone p {
+      font-size: 12px;
+      color: #94a3b8;
+    }
+
+    #drop-zone small {
+      font-size: 10px;
+      color: #475569;
+      display: block;
+      margin-top: 4px;
+    }
+
+    #file-input {
+      display: none;
+    }
+
+    #status {
+      font-size: 11px;
+      color: #94a3b8;
+      max-width: 360px;
+      text-align: center;
+      min-height: 40px;
+    }
+
+    .success {
+      color: #4ade80 !important;
+    }
+
+    .error {
+      color: #f87171 !important;
+    }
+
+    .spin {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid #818cf8;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <h2>👻 MINDSTACK — FILE UPLOAD</h2>
+  <div id="drop-zone">
+    <div class="icon">📂</div>
+    <p>Click here or drag a file to upload</p>
+    <small>PDF or image · session must be active</small>
+  </div>
+  <input type="file" id="file-input" accept=".pdf,image/*" />
+  <div id="status"></div>
+
+  <script type="module" src="./upload.ts"></script>
+</body>
+
+</html>
