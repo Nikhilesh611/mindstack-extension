@@ -13,9 +13,8 @@
  */
 
 const MIN_SEGMENT_DURATION_SEC = 3;
-const PERIODIC_INTERVAL_MS = 30_000;   // capture every 30s regardless of video length
+const PERIODIC_INTERVAL_SEC = 30;       // capture every 30s of video playback time
 const MAX_PERIODIC_CAPTURES = 20;        // safety cap per video
-const DURATION_RETRY_DELAY_MS = 1_500;
 
 // ---------------------------------------------------------------------------
 // Toast
@@ -240,28 +239,28 @@ async function sendVideoSegment(
 
 // ---------------------------------------------------------------------------
 // VideoTracker
-// BUG 1 FIX: Periodic captures use a fixed 30s interval (PERIODIC_INTERVAL_MS)
-//            instead of duration/MAX_CAPTURES — fires unconditionally while playing.
-// BUG 2 FIX: Segments are non-overlapping — segmentStartTime resets to endTime
-//            after each periodic capture.
+// BUG 1 FIX: Uses native 'timeupdate' event instead of setInterval!
+//            Fires reliably based on actual video time playback, immune to
+//            background tab throttling or 2x speed variations! No interaction needed.
+// BUG 2 FIX: Segments are non-overlapping — segmentStartTime resets to endTime.
 // ---------------------------------------------------------------------------
 
 class VideoTracker {
     private video: HTMLVideoElement;
     private segmentStartTime: number | null = null;
     private captureCount = 0;
-    private intervalHandle: ReturnType<typeof setInterval> | null = null;
-    private durationRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
     private onPlayBound: () => void;
     private onPauseBound: () => void;
     private onEndedBound: () => void;
+    private onTimeUpdateBound: () => void;
 
     constructor(video: HTMLVideoElement) {
         this.video = video;
         this.onPlayBound = this.onPlay.bind(this);
         this.onPauseBound = this.onPause.bind(this);
         this.onEndedBound = this.onEnded.bind(this);
+        this.onTimeUpdateBound = this.onTimeUpdate.bind(this);
         this.attach();
     }
 
@@ -269,6 +268,7 @@ class VideoTracker {
         this.video.addEventListener('play', this.onPlayBound);
         this.video.addEventListener('pause', this.onPauseBound);
         this.video.addEventListener('ended', this.onEndedBound);
+        this.video.addEventListener('timeupdate', this.onTimeUpdateBound);
         console.log('[MindStack YT] Tracker attached.');
 
         // If video is already playing when we attach, start tracking immediately
@@ -282,18 +282,16 @@ class VideoTracker {
         this.video.removeEventListener('play', this.onPlayBound);
         this.video.removeEventListener('pause', this.onPauseBound);
         this.video.removeEventListener('ended', this.onEndedBound);
-        this.stopPeriodicCapture();
+        this.video.removeEventListener('timeupdate', this.onTimeUpdateBound);
         console.log('[MindStack YT] Tracker destroyed.');
     }
 
     private onPlay(): void {
         this.segmentStartTime = this.video.currentTime;
-        this.startPeriodicCapture();
         console.log(`[MindStack YT] Play — segment start at ${this.segmentStartTime.toFixed(1)}s`);
     }
 
     private onPause(): void {
-        this.stopPeriodicCapture();
         if (this.segmentStartTime !== null) {
             const frame = captureKeyframe(this.video); // sync, before any await
             const endTime = this.video.currentTime;
@@ -308,62 +306,33 @@ class VideoTracker {
         this.onPause();
     }
 
-    // BUG 1 FIX: Use setInterval with a fixed 30s period.
-    // setInterval fires repeatedly without needing user interaction (pause/play).
-    // Each fire sends the current non-overlapping segment and resets the start.
-    private startPeriodicCapture(): void {
-        this.stopPeriodicCapture(); // avoid double-start
+    // Fires ~4 times a second during playback. Fully reliable.
+    private onTimeUpdate(): void {
+        if (this.video.paused || this.video.ended || this.segmentStartTime === null) return;
 
-        const tryStart = () => {
-            const duration = this.video.duration;
-            if (!isFinite(duration) || duration <= 0) {
-                console.log('[MindStack YT] Duration not ready — retrying in 1.5s');
-                this.durationRetryTimer = setTimeout(tryStart, DURATION_RETRY_DELAY_MS);
+        const currentVideoTime = this.video.currentTime;
+        const elapsed = currentVideoTime - this.segmentStartTime;
+
+        if (elapsed >= PERIODIC_INTERVAL_SEC) {
+            if (this.captureCount >= MAX_PERIODIC_CAPTURES) {
+                // Throttle logs so we don't spam every 250ms
+                if (Math.random() < 0.05) console.log('[MindStack YT] Max captures reached, skipping.');
                 return;
             }
 
-            console.log(`[MindStack YT] Starting periodic capture every ${PERIODIC_INTERVAL_MS / 1000}s`);
+            const frame = captureKeyframe(this.video); // sync capture
+            const endTime = currentVideoTime;
+            const startTime = this.segmentStartTime;
 
-            this.intervalHandle = setInterval(() => {
-                if (this.video.paused || this.video.ended) {
-                    // Video paused mid-interval — the pause handler will send the segment
-                    this.stopPeriodicCapture();
-                    return;
-                }
-                if (this.segmentStartTime === null) return;
-                if (this.captureCount >= MAX_PERIODIC_CAPTURES) {
-                    console.log('[MindStack YT] Max periodic captures reached.');
-                    this.stopPeriodicCapture();
-                    return;
-                }
+            // BUG 2 FIX: reset start to endTime so next segment is non-overlapping
+            this.segmentStartTime = endTime;
+            this.captureCount++;
 
-                const frame = captureKeyframe(this.video); // sync capture
-                const endTime = this.video.currentTime;
-                const startTime = this.segmentStartTime;
-
-                // BUG 2 FIX: reset start to endTime so next segment is non-overlapping
-                this.segmentStartTime = endTime;
-                this.captureCount++;
-
-                console.log(
-                    `[MindStack YT] Periodic capture #${this.captureCount}/${MAX_PERIODIC_CAPTURES} ` +
-                    `at ${endTime.toFixed(1)}s`
-                );
-                sendVideoSegment(this.video, startTime, endTime, frame);
-            }, PERIODIC_INTERVAL_MS);
-        };
-
-        tryStart();
-    }
-
-    private stopPeriodicCapture(): void {
-        if (this.intervalHandle !== null) {
-            clearInterval(this.intervalHandle);
-            this.intervalHandle = null;
-        }
-        if (this.durationRetryTimer !== null) {
-            clearTimeout(this.durationRetryTimer);
-            this.durationRetryTimer = null;
+            console.log(
+                `[MindStack YT] Periodic capture #${this.captureCount}/${MAX_PERIODIC_CAPTURES} ` +
+                `at ${endTime.toFixed(1)}s`
+            );
+            sendVideoSegment(this.video, startTime, endTime, frame);
         }
     }
 }
@@ -385,12 +354,12 @@ function initTracker(video: HTMLVideoElement): void {
 }
 
 function findAndTrackVideo(): void {
-    const video = document.querySelector<HTMLVideoElement>('video');
+    const video = document.querySelector<HTMLVideoElement>('video.html5-main-video') || document.querySelector<HTMLVideoElement>('video');
     if (video) {
         initTracker(video);
     } else {
         const mo = new MutationObserver((_, obs) => {
-            const v = document.querySelector<HTMLVideoElement>('video');
+            const v = document.querySelector<HTMLVideoElement>('video.html5-main-video') || document.querySelector<HTMLVideoElement>('video');
             if (v) {
                 obs.disconnect();
                 initTracker(v);
