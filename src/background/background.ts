@@ -493,26 +493,12 @@ async function handleMessage(message: ExtensionMessage, sender?: chrome.runtime.
                 return { success: false, error: result.error ?? 'Failed to get presigned URL' };
             }
 
-            // Explicitly destructure so Chrome's message serializer cannot lose fields.
+            // EXACT URL from backend. NO tampering.
             const { upload_url, s3_url } = result.data;
 
-            // S3 SDK may inject x-amz-checksum-crc32 params into the presigned URL.
-            // A plain browser fetch PUT cannot send the matching x-amz-checksum-crc32
-            // header, so S3 rejects the request with 400. Strip those params so the
-            // PUT succeeds without requiring a checksum.
-            const cleanUploadUrl = (() => {
-                try {
-                    const u = new URL(upload_url);
-                    ['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm'].forEach((p) => u.searchParams.delete(p));
-                    return u.toString();
-                } catch {
-                    return upload_url;
-                }
-            })();
+            console.log('[MindStack BG] GET_PRESIGNED_URL — raw url:', upload_url.slice(0, 80));
 
-            console.log('[MindStack BG] GET_PRESIGNED_URL — cleaned upload_url prefix:', cleanUploadUrl?.slice(0, 80));
-
-            return { success: true, data: { upload_url: cleanUploadUrl, s3_url } };
+            return { success: true, data: { upload_url, s3_url } };
         }
 
         // ── GET_CAPTURES ──────────────────────────────────────────────

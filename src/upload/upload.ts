@@ -59,11 +59,13 @@ async function handleFile(file: File, statusEl: HTMLElement): Promise<void> {
         const presignRes = await sendMsg({
             type: 'GET_PRESIGNED_URL',
             file_name: file.name,
-            file_type: file.type,
+            file_type: file.type, // We send this to the backend so it knows what to sign
         });
+
         if (!presignRes?.success || !presignRes.data) {
             throw new Error(presignRes?.error ?? 'Presign failed (no data returned)');
         }
+
         const raw = presignRes.data as Record<string, string>;
         const uploadUrl = raw['upload_url'] ?? raw['url'] ?? '';
         const s3Url = raw['s3_url'] ?? raw['key'] ?? '';
@@ -71,11 +73,17 @@ async function handleFile(file: File, statusEl: HTMLElement): Promise<void> {
 
         // Step 2 — PUT to S3
         setStatus(statusEl, '<span class="spin"></span> Uploading to S3…');
+
+        // 1. Convert to pure bytes so Chrome cannot inject headers
+        const rawBytes = await file.arrayBuffer();
+
+        // 2. Send with correct headers
         const putRes = await fetch(uploadUrl, {
             method: 'PUT',
             headers: { 'Content-Type': file.type },
-            body: file,
+            body: rawBytes, // Ensure we pass the raw bytes here so Chrome doesn't mess with boundaries!
         });
+
         if (!putRes.ok) {
             let detail = '';
             try { detail = await putRes.text(); } catch { /* ignore */ }
@@ -97,7 +105,7 @@ async function handleFile(file: File, statusEl: HTMLElement): Promise<void> {
             },
         });
         if (!ingestRes?.success) throw new Error(ingestRes?.error ?? 'Ingest failed');
-        const captureId = (ingestRes.data as unknown as { capture_id: string })?.capture_id;
+        const captureId = ingestRes.data?.capture_id ?? ingestRes.capture_id;
 
         // Step 4 — PDF extraction
         if (isPdf && captureId) {
